@@ -3734,7 +3734,6 @@ export default function PulsoApp() {
       setActivity([]);
       setLeads([]);
       setEstoque([]);
-      setIndicacoes([]);
       setCobrancas([]);
       return;
     }
