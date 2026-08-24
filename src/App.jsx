@@ -51,8 +51,8 @@ import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
 
 const CLINICAS = [
-  { id: "sorridents", nome: "Sorridents Centro", curto: "Sorridents", baseRoleLabel: "Recepção" },
-  { id: "gio", nome: "GIO Estética Higienópolis", curto: "GIO Estética", baseRoleLabel: "Comercial" },
+  { id: "sorridents", nome: "Sorridents Centro", curto: "Sorridents", baseRoleLabel: "Recepção", gerenteRoleLabel: "Gerente" },
+  { id: "gio", nome: "GIO Estética Higienópolis", curto: "GIO Estética", baseRoleLabel: "Comercial", gerenteRoleLabel: "Supervisor Comercial" },
 ];
 
 const STATUS = {
@@ -241,23 +241,33 @@ function mapIndicacao(row) {
   };
 }
 
+// Data relevante de contato do lead: na etapa "avaliação agendada" é a data
+// da avaliação; nas outras, é o próximo contato marcado (follow-up). É a
+// mesma regra que já decide qual data o card mostra (ver LeadCard).
+function leadContatoRelevante(lead) {
+  if (lead.etapa === "avaliacao_agendada" && lead.dataAvaliacao) return lead.dataAvaliacao;
+  return lead.proximoContato;
+}
+
 function isFollowUpAtrasado(lead) {
-  if (!lead.proximoContato) return false;
+  const data = leadContatoRelevante(lead);
+  if (!data) return false;
   if (lead.etapa === "fechado" || lead.etapa === "perdido") return false;
   const hoje = new Date();
   hoje.setHours(0, 0, 0, 0);
-  const d = new Date(lead.proximoContato + "T00:00:00");
+  const d = new Date(data + "T00:00:00");
   return d < hoje;
 }
 
 function isFollowUpHoje(lead) {
-  if (!lead.proximoContato) return false;
+  const data = leadContatoRelevante(lead);
+  if (!data) return false;
   if (lead.etapa === "fechado" || lead.etapa === "perdido") return false;
-  return lead.proximoContato === todayISO();
+  return data === todayISO();
 }
 
 function clinicaInfo(id) {
-  return CLINICAS.find((c) => c.id === id) || { nome: "—", curto: "—", baseRoleLabel: "Equipe" };
+  return CLINICAS.find((c) => c.id === id) || { nome: "—", curto: "—", baseRoleLabel: "Equipe", gerenteRoleLabel: "Gerente" };
 }
 
 // ---------- Estoque ----------
@@ -290,7 +300,7 @@ function mesAnoLabel() {
 
 function roleLabel(role, clinicaId) {
   if (role === "owner") return "Gestor";
-  if (role === "gerente") return "Gerente";
+  if (role === "gerente") return clinicaInfo(clinicaId).gerenteRoleLabel;
   if (role === "tecnico") return "Técnico";
   return clinicaInfo(clinicaId).baseRoleLabel;
 }
@@ -535,6 +545,7 @@ function mapTask(row) {
     prioridade: row.prioridade || "media",
     categoria: row.categoria || null,
     cobrancaId: row.cobranca_id || null,
+    leadId: row.lead_id || null,
   };
 }
 
@@ -1468,6 +1479,7 @@ function TaskDetailModal({
   onDelegate,
   onStopRecurrence,
   onGoToCobrancas,
+  onGoToLead,
   onUpdateStatus,
 }) {
   const [novoComentario, setNovoComentario] = useState("");
@@ -1543,6 +1555,20 @@ function TaskDetailModal({
                 <CreditCard size={13} /> Ver cobrança
               </button>
             )}
+          </div>
+        )}
+        {task.leadId && onGoToLead && (
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <button
+              className="gec-btn gec-btn-ghost"
+              style={{ fontSize: 12, padding: "6px 10px", display: "inline-flex", alignItems: "center", gap: 6 }}
+              onClick={() => {
+                onClose();
+                onGoToLead();
+              }}
+            >
+              <Briefcase size={13} /> Ver lead
+            </button>
           </div>
         )}
         <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
@@ -1736,11 +1762,14 @@ function TaskDetailModal({
 // ---------- Cartão de tarefa (usado no board em colunas) ----------
 function TaskCard({ task, team, showResponsavel, canDelete, attachmentsCount, commentsCount, checklistProgress, onOpenDetail, onMoveStatus, onRequestConclude, onDelete }) {
   const critica = isAtrasada(task);
+  const venceHoje = !critica && isVenceHoje(task);
+  const cardStyle = critica
+    ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
+    : venceHoje
+    ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
+    : undefined;
   return (
-    <div
-      className="gec-task-card"
-      style={critica ? { borderColor: "var(--danger)", background: "var(--danger-soft)" } : undefined}
-    >
+    <div className="gec-task-card" style={cardStyle}>
       <div style={{ fontWeight: 600, fontSize: 13.5 }}>{task.titulo}</div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", gap: 6, flexWrap: "wrap" }}>
         {showResponsavel && <span>{memberName(task.responsavelId, team)}</span>}
@@ -1940,13 +1969,19 @@ function MyTasksView({ user, tasks, leads, assignableOptions, lockedClinicaId, a
   const [showModal, setShowModal] = useState(false);
   const [concludeTarget, setConcludeTarget] = useState(null);
   const mine = tasks.filter((t) => t.responsavelId === user.id);
-  const meusFollowUpsHoje = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpHoje(l));
-  const meusFollowUpsAtrasados = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpAtrasado(l));
+  // Follow-up/avaliação atrasados ou vencendo hoje já viram tarefa de
+  // verdade sozinhos (ver o useEffect ao lado de handleGenerateFollowUpTask,
+  // em PulsoApp) — esse aviso aqui é só uma rede de segurança pro instante
+  // antes dela existir, então exclui os leads que já têm a tarefa real
+  // correspondente, pra não duplicar o aviso.
+  const temTarefaReal = (l) => tasks.some((t) => t.leadId === l.id && t.prazo === leadContatoRelevante(l));
+  const meusFollowUpsHoje = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpHoje(l) && !temTarefaReal(l));
+  const meusFollowUpsAtrasados = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpAtrasado(l) && !temTarefaReal(l));
   const leadItems = [
     ...meusFollowUpsAtrasados.map((l) => ({
       id: `l-${l.id}`,
       titulo: `${l.nomePaciente} · ${l.etapa === "avaliacao_agendada" ? "confirmar avaliação" : "follow-up"}`,
-      prazo: l.proximoContato,
+      prazo: leadContatoRelevante(l),
       tipo: "atrasada",
       subtitulo: null,
       onOpen: () => onOpenLead && onOpenLead(l),
@@ -1954,7 +1989,7 @@ function MyTasksView({ user, tasks, leads, assignableOptions, lockedClinicaId, a
     ...meusFollowUpsHoje.map((l) => ({
       id: `l-${l.id}`,
       titulo: `${l.nomePaciente} · ${l.etapa === "avaliacao_agendada" ? "confirmar avaliação" : "follow-up"}`,
-      prazo: l.proximoContato,
+      prazo: leadContatoRelevante(l),
       tipo: "followup",
       subtitulo: null,
       onOpen: () => onOpenLead && onOpenLead(l),
@@ -2045,8 +2080,18 @@ function TeamView({ team }) {
 // ---------- Kanban comercial: cartão de oportunidade ----------
 function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete }) {
   const isGio = lead.clinicaId === "gio";
+  // Fundo do card conforme o prazo de contato (follow-up ou avaliação, o que
+  // valer pra etapa atual — ver leadContatoRelevante): atrasado em vermelho
+  // leve, vencendo hoje em amarelo leve, futuro/sem data fica neutro.
+  const atrasado = isFollowUpAtrasado(lead);
+  const hoje = !atrasado && isFollowUpHoje(lead);
+  const cardStyle = atrasado
+    ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
+    : hoje
+    ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
+    : undefined;
   return (
-    <div className="gec-task-card">
+    <div className="gec-task-card" style={cardStyle}>
       <div style={{ fontWeight: 600, fontSize: 13.5 }}>{lead.nomePaciente}</div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", flexDirection: "column", gap: 3 }}>
         {lead.whatsapp && (
@@ -2901,10 +2946,21 @@ function COBRANCA_LABEL(formaPagamento) {
 
 // ---------- Cobranças da GIO: linha de um cliente ----------
 function CobrancaRow({ cobranca, onEdit, tarefaAtual, onMarkPaid, onUndoPaid }) {
+  // Mesma cor de fundo das tarefas/leads, olhando a tarefa de cobrança do
+  // ciclo atual: atrasada (venceu e ainda não foi gerada/concluída) fica
+  // vermelho leve, vencendo hoje fica amarelo leve, senão neutro — inclusive
+  // quando ainda não existe tarefa pra essa cobrança (nada vencendo agora).
+  const atrasada = !!tarefaAtual && isAtrasada(tarefaAtual);
+  const venceHoje = !atrasada && !!tarefaAtual && isVenceHoje(tarefaAtual);
+  const corStatus = atrasada
+    ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
+    : venceHoje
+    ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
+    : {};
   return (
     <div
       className="gec-card"
-      style={{ padding: 14, display: "flex", flexDirection: "column", gap: 6, opacity: cobranca.ativo ? 1 : 0.6, cursor: "pointer" }}
+      style={{ padding: 14, display: "flex", flexDirection: "column", gap: 6, opacity: cobranca.ativo ? 1 : 0.6, cursor: "pointer", ...corStatus }}
       onClick={() => onEdit(cobranca)}
     >
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
@@ -4091,6 +4147,48 @@ export default function PulsoApp() {
         handleGenerateCobrancaTask(c, info, responsavelId);
       });
   }, [cobrancas, tasks, team, profile, handleGenerateCobrancaTask]);
+
+  const handleGenerateFollowUpTask = useCallback(
+    async (lead, prazo, titulo, responsavelId) => {
+      const { error: insErr } = await supabase.from("tasks").insert({
+        titulo,
+        clinica_id: lead.clinicaId,
+        responsavel_id: responsavelId,
+        status: "pendente",
+        prazo,
+        criado_por: profile?.id,
+        categoria: "atendimento",
+        lead_id: lead.id,
+      });
+      // Se der erro (ex: outra sessão da equipe já criou essa mesma tarefa no
+      // mesmo instante — a trava do banco impede duplicar), não tem o que
+      // fazer além de deixar quieto; a próxima checagem não tenta de novo
+      // porque a tarefa já existe.
+      if (insErr) return;
+      fetchTasks();
+    },
+    [profile, fetchTasks]
+  );
+
+  // Toda vez que a lista de leads/tarefas muda (inclusive ao abrir o app),
+  // confere se algum lead com responsável comercial definido está com
+  // follow-up (ou avaliação, na etapa "avaliação agendada" — ver
+  // leadContatoRelevante) vencendo hoje ou atrasado, e cria a tarefa
+  // correspondente pro responsável — mesmo mecanismo das Cobranças.
+  useEffect(() => {
+    if (!profile || leads.length === 0) return;
+    leads.forEach((l) => {
+      if (!l.responsavelComercial) return;
+      const atrasado = isFollowUpAtrasado(l);
+      const venceHoje = !atrasado && isFollowUpHoje(l);
+      if (!atrasado && !venceHoje) return;
+      const prazo = leadContatoRelevante(l);
+      const jaExiste = tasks.some((t) => t.leadId === l.id && t.prazo === prazo);
+      if (jaExiste) return;
+      const titulo = `${l.etapa === "avaliacao_agendada" ? "Confirmar avaliação" : "Follow-up"} — ${l.nomePaciente}`;
+      handleGenerateFollowUpTask(l, prazo, titulo, l.responsavelComercial);
+    });
+  }, [leads, tasks, profile, handleGenerateFollowUpTask]);
   function estoquePatchToRow(patch) {
     const row = {};
     if ("clinicaId" in patch) row.clinica_id = patch.clinicaId;
@@ -4308,6 +4406,7 @@ export default function PulsoApp() {
     ? [
         { id: "painel", label: "Painel", icon: LayoutDashboard },
         { id: "tarefas", label: "Tarefas", icon: ClipboardList },
+        { id: "minhas", label: "Minhas tarefas", icon: UserCheck },
         { id: "comercial", label: "Comercial", icon: Briefcase },
         { id: "estoque", label: "Estoque", icon: Package },
         ...(vePraSorridents ? [limpezaTab] : []),
@@ -4437,6 +4536,23 @@ export default function PulsoApp() {
 
         {isOwner && activeView === "equipe" && <TeamView team={staffTeam} />}
 
+        {isGerente && activeView === "minhas" && (
+          <MyTasksView
+            user={user}
+            tasks={tasks}
+            leads={leads}
+            assignableOptions={assignableOptions}
+            lockedClinicaId={user.clinicaId}
+            attachmentsByTask={attachmentsByTask}
+            commentsByTask={commentsByTask}
+            checklistByTask={checklistByTask}
+            onUpdateStatus={handleUpdateStatus}
+            onCreate={handleCreateTask}
+            onOpenDetail={setDetailTarget}
+            onOpenLead={setDetailLead}
+          />
+        )}
+
         {isBase && activeView === "minhas" && (
           <MyTasksView
             user={user}
@@ -4551,6 +4667,14 @@ export default function PulsoApp() {
           onDelegate={handleDelegate}
           onStopRecurrence={handleStopRecurrence}
           onGoToCobrancas={() => setView("cobrancas")}
+          onGoToLead={() => {
+            const t = tasks.find((x) => x.id === detailTarget.id) || detailTarget;
+            const l = leads.find((x) => x.id === t.leadId);
+            if (l) {
+              setDetailTarget(null);
+              setDetailLead(l);
+            }
+          }}
           onUpdateStatus={handleUpdateStatus}
         />
       )}
