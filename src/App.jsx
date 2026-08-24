@@ -82,7 +82,8 @@ function categoriaLabel(id) {
 
 // ---------- Kanban comercial ----------
 const LEAD_STAGES = [
-  { id: "indicacao_recebida", label: "Indicação recebida" },
+  { id: "indicacao_procedimento", label: "Indicação Procedimento" },
+  { id: "indicacao_cliente", label: "Indicação Cliente" },
   { id: "avaliacao_agendada", label: "Avaliação agendada" },
   { id: "faltou_avaliacao", label: "Faltou na avaliação" },
   { id: "orcamento_apresentado", label: "Orçamento apresentado" },
@@ -92,6 +93,9 @@ const LEAD_STAGES = [
   { id: "fechado", label: "Fechado" },
   { id: "perdido", label: "Perdido" },
 ];
+// Etapas de indicação só existem no funil da GIO (a Sorridents não trabalha
+// indicação de procedimento nem indicação de cliente por esse funil).
+const INDICACAO_STAGE_IDS = ["indicacao_procedimento", "indicacao_cliente"];
 const ORIGENS_LEAD = [
   { id: "instagram", label: "Instagram" },
   { id: "indicacao", label: "Indicação" },
@@ -136,7 +140,6 @@ function mapLead(row) {
     prioridade: row.prioridade,
     historia: row.historia,
     evolucao: row.evolucao,
-    indicadoPorTecnicoId: row.indicado_por_tecnico_id,
     observacoes: row.observacoes,
     criadoPor: row.criado_por,
     criadoEm: row.criado_em,
@@ -227,18 +230,50 @@ function computeCobrancaTask(cobranca, hojeISO) {
   return { titulo, prazo: vencimento };
 }
 
-function mapIndicacao(row) {
-  return {
-    id: row.id,
-    clinicaId: row.clinica_id,
-    tecnicoId: row.tecnico_id,
-    nomePaciente: row.nome_paciente,
-    procedimento: row.procedimento,
-    observacao: row.observacao,
-    dataIndicacao: row.data_indicacao,
-    leadId: row.lead_id,
-    criadoEm: row.criado_em,
-  };
+// Mesma data de vencimento, N meses à frente (clampando em meses mais
+// curtos, igual dueDateThisCycle). Usada só pra mostrar "próximo
+// vencimento" quando o ciclo atual já foi pago.
+function dueDateMonthsAhead(diaVencimento, refDateISO, monthsToAdd) {
+  const [y, m] = refDateISO.split("-").map(Number);
+  const total = (m - 1) + monthsToAdd;
+  const ny = y + Math.floor(total / 12);
+  const nm0 = ((total % 12) + 12) % 12;
+  const day = clampDayToMonth(ny, nm0, diaVencimento);
+  return `${ny}-${String(nm0 + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// Acha a tarefa de cobrança mais recente (qualquer status) pra essa cobrança
+// — usada pra saber se o ciclo atual já foi marcado como pago.
+function tarefaAtualDaCobranca(tasks, cobrancaId) {
+  const doCliente = (tasks || []).filter((t) => t.cobrancaId === cobrancaId).sort((a, b) => (b.prazo || "").localeCompare(a.prazo || ""));
+  return doCliente[0] || null;
+}
+
+// Resume o próximo vencimento de uma cobrança em texto claro (em vez de só
+// "dia XX", que exige conta de cabeça) — pra exibição e pra ordenar a lista
+// por urgência. Não muda nada no fluxo de marcar como paga: se o ciclo atual
+// já foi concluído, mostra o vencimento do mês seguinte em vez do que já
+// passou. Retorna { status, label, dias }, com status em:
+// "atrasada" | "hoje" | "amanha" | "futura" | "paga" | "quitada" | "inativa".
+function proximoVencimentoInfo(cobranca, tarefaAtual, hojeISO) {
+  if (!cobranca.ativo) return { status: "inativa", label: "Inativa", dias: null };
+  if (cobranca.parcelasPagas >= cobranca.numeroParcelas) {
+    return { status: "quitada", label: "Todas as parcelas pagas", dias: null };
+  }
+  const cicloAtual = dueDateThisCycle(cobranca.diaVencimento, hojeISO);
+  const cicloPago = !!tarefaAtual && tarefaAtual.prazo === cicloAtual && tarefaAtual.status === "concluida";
+  const vencimento = cicloPago ? dueDateMonthsAhead(cobranca.diaVencimento, hojeISO, 1) : cicloAtual;
+  const dias = daysBetweenISO(hojeISO, vencimento);
+  if (cicloPago) {
+    return { status: "paga", label: `Pago este mês · próximo vencimento ${fmtDate(vencimento)}`, dias };
+  }
+  if (dias < 0) {
+    const n = Math.abs(dias);
+    return { status: "atrasada", label: `Venceu há ${n} dia${n === 1 ? "" : "s"} (${fmtDate(vencimento)})`, dias };
+  }
+  if (dias === 0) return { status: "hoje", label: "Vence hoje", dias };
+  if (dias === 1) return { status: "amanha", label: `Vence amanhã (${fmtDate(vencimento)})`, dias };
+  return { status: "futura", label: `Vence em ${dias} dias (${fmtDate(vencimento)})`, dias };
 }
 
 // Data relevante de contato do lead: na etapa "avaliação agendada" é a data
@@ -301,7 +336,6 @@ function mesAnoLabel() {
 function roleLabel(role, clinicaId) {
   if (role === "owner") return "Gestor";
   if (role === "gerente") return clinicaInfo(clinicaId).gerenteRoleLabel;
-  if (role === "tecnico") return "Técnico";
   return clinicaInfo(clinicaId).baseRoleLabel;
 }
 
@@ -432,6 +466,43 @@ function parseAgendaRows(rows) {
   return { rows: out, missing };
 }
 
+// Modelo simples de planilha pra importar cards de "Indicação Procedimento"
+// na GIO: procura a coluna "Nome do Paciente" (única obrigatória) e, se
+// existirem, "WhatsApp", "Procedimento" e "Observações".
+function parseIndicacaoProcedimentoRows(rows) {
+  let headerIdx = -1;
+  let colNome = -1;
+  let colWhatsapp = -1;
+  let colProcedimento = -1;
+  let colObservacoes = -1;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const idx = row.findIndex((c) => normHeaderCell(c) === "nome do paciente");
+    if (idx !== -1) {
+      headerIdx = i;
+      colNome = idx;
+      colWhatsapp = row.findIndex((c) => normHeaderCell(c) === "whatsapp");
+      colProcedimento = row.findIndex((c) => normHeaderCell(c) === "procedimento");
+      colObservacoes = row.findIndex((c) => normHeaderCell(c) === "observações" || normHeaderCell(c) === "observacoes");
+      break;
+    }
+  }
+  if (headerIdx === -1 || colNome === -1) return { rows: [], missing: [] };
+  const out = [];
+  for (let i = headerIdx + 1; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const nome = String(row[colNome] || "").trim();
+    if (!nome) continue;
+    out.push({
+      nomePaciente: toTitleCaseName(nome),
+      whatsapp: colWhatsapp !== -1 ? String(row[colWhatsapp] || "").trim() || null : null,
+      procedimento: colProcedimento !== -1 ? String(row[colProcedimento] || "").trim() || null : null,
+      observacoes: colObservacoes !== -1 ? String(row[colObservacoes] || "").trim() || null : null,
+    });
+  }
+  return { rows: out, missing: [] };
+}
+
 const WEEKDAYS = [
   { v: 0, label: "Dom" },
   { v: 1, label: "Seg" },
@@ -508,14 +579,11 @@ function recurrenceLabel(r) {
 }
 
 function getAssignableOptions(user, team) {
-  // Técnico nunca aparece como opção de responsável: o papel só tem acesso à
-  // aba Indicações, não tem "Minhas tarefas" pra ver/concluir nada atribuído.
-  const semTecnico = team.filter((m) => m.role !== "tecnico");
-  if (user.role === "owner") return semTecnico;
+  if (user.role === "owner") return team;
   if (user.role === "gerente") {
-    return semTecnico.filter((m) => m.clinicaId === user.clinicaId || m.role === "owner");
+    return team.filter((m) => m.clinicaId === user.clinicaId || m.role === "owner");
   }
-  return semTecnico.filter(
+  return team.filter(
     (m) => m.id === user.id || (m.role === "gerente" && m.clinicaId === user.clinicaId)
   );
 }
@@ -1930,23 +1998,22 @@ function TasksView({
           </button>
         </div>
 
-        {filtered.length === 0 ? (
-          <EmptyState icon={ClipboardList} title="Nenhuma tarefa por aqui" subtitle="Crie uma tarefa para começar a acompanhar a equipe." />
-        ) : (
-          <TaskBoard
-            team={team}
-            tasks={filtered}
-            attachmentsByTask={attachmentsByTask}
-            commentsByTask={commentsByTask}
-            checklistByTask={checklistByTask}
-            showResponsavel
-            canDelete
-            onMoveStatus={handleMoveStatus}
-            onRequestConclude={setConcludeTarget}
-            onDelete={onDelete}
-            onOpenDetail={onOpenDetail}
-          />
-        )}
+        {/* O board sempre aparece com as 3 colunas de status (mesmo sem
+            nenhuma tarefa ainda) — cada coluna já mostra "Nada aqui" quando
+            vazia, mas a estrutura fica visível pro time desde o início. */}
+        <TaskBoard
+          team={team}
+          tasks={filtered}
+          attachmentsByTask={attachmentsByTask}
+          commentsByTask={commentsByTask}
+          checklistByTask={checklistByTask}
+          showResponsavel
+          canDelete
+          onMoveStatus={handleMoveStatus}
+          onRequestConclude={setConcludeTarget}
+          onDelete={onDelete}
+          onOpenDetail={onOpenDetail}
+        />
       </div>
 
       {showModal && (
@@ -2012,23 +2079,19 @@ function MyTasksView({ user, tasks, leads, assignableOptions, lockedClinicaId, a
             <Plus size={15} /> Nova tarefa
           </button>
         </div>
-        {mine.length === 0 ? (
-          <EmptyState icon={ClipboardList} title="Nenhuma tarefa atribuída" subtitle="Quando alguém criar uma tarefa pra você, ela aparece aqui." />
-        ) : (
-          <TaskBoard
-            team={[]}
-            tasks={mine}
-            attachmentsByTask={attachmentsByTask}
-            commentsByTask={commentsByTask}
-            checklistByTask={checklistByTask}
-            showResponsavel={false}
-            canDelete={false}
-            onMoveStatus={handleMoveStatus}
-            onRequestConclude={setConcludeTarget}
-            onDelete={() => {}}
-            onOpenDetail={onOpenDetail}
-          />
-        )}
+        <TaskBoard
+          team={[]}
+          tasks={mine}
+          attachmentsByTask={attachmentsByTask}
+          commentsByTask={commentsByTask}
+          checklistByTask={checklistByTask}
+          showResponsavel={false}
+          canDelete={false}
+          onMoveStatus={handleMoveStatus}
+          onRequestConclude={setConcludeTarget}
+          onDelete={() => {}}
+          onOpenDetail={onOpenDetail}
+        />
       </div>
       {showModal && (
         <NewTaskModal
@@ -2158,9 +2221,9 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
         </div>
       )}
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {isGio && lead.indicadoPorTecnicoId && (
+        {isGio && lead.indicadoPor && (
           <span className="gec-pill" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-            <Stethoscope size={11} /> Indicação de {memberName(lead.indicadoPorTecnicoId, team)}
+            <Stethoscope size={11} /> Indicação de {lead.indicadoPor}
           </span>
         )}
         {isGio && lead.origem && (
@@ -2175,7 +2238,7 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
         value={lead.etapa}
         onChange={(e) => onChangeStage(lead.id, e.target.value)}
       >
-        {LEAD_STAGES.filter((s) => isGio || s.id !== "indicacao_recebida").map((s) => (
+        {LEAD_STAGES.filter((s) => isGio || !INDICACAO_STAGE_IDS.includes(s.id)).map((s) => (
           <option key={s.id} value={s.id}>{s.label}</option>
         ))}
       </select>
@@ -2194,8 +2257,8 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
 }
 
 // ---------- Kanban comercial: board horizontal com as 8 etapas ----------
-function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete, hideIndicacaoRecebida = false }) {
-  const stages = hideIndicacaoRecebida ? LEAD_STAGES.filter((s) => s.id !== "indicacao_recebida") : LEAD_STAGES;
+function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete, hideIndicacaoStages = false }) {
+  const stages = hideIndicacaoStages ? LEAD_STAGES.filter((s) => !INDICACAO_STAGE_IDS.includes(s.id)) : LEAD_STAGES;
   return (
     <div className="gec-scrollbar" style={{ display: "flex", gap: 14, overflowX: "auto", paddingBottom: 8, alignItems: "flex-start" }}>
       {stages.map((stage) => {
@@ -2297,9 +2360,7 @@ function FollowUpModal({ initialDate, onCancel, onConfirm }) {
 function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, onSave, onDelete }) {
   const effectiveClinicaId = lead ? lead.clinicaId : clinicaId;
   const isGio = effectiveClinicaId === "gio";
-  // Técnico não aparece como opção de responsável comercial (não acompanha o
-  // funil, só registra indicação).
-  const clinicTeam = team.filter((m) => m.role !== "tecnico" && (m.clinicaId === effectiveClinicaId || m.role === "owner"));
+  const clinicTeam = team.filter((m) => m.clinicaId === effectiveClinicaId || m.role === "owner");
 
   const [nomePaciente, setNomePaciente] = useState(lead?.nomePaciente || "");
   const [codigoPaciente, setCodigoPaciente] = useState(lead?.codigoPaciente || "");
@@ -2324,6 +2385,10 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
   // que já nasce atrasada).
   const [confirmPastAvaliacao, setConfirmPastAvaliacao] = useState(false);
   const isPastAvaliacao = !!dataAvaliacao && dataAvaliacao < todayISO();
+  // "Quem indicou" aparece se a origem for indicação OU se a etapa já for
+  // Indicação Cliente (nessa etapa a referência de quem indicou é o próprio
+  // motivo do card existir, então não depende de marcar a origem também).
+  const showIndicadoPor = origem === "indicacao" || etapa === "indicacao_cliente";
 
   function buildPatch(followUpDate) {
     const full = {
@@ -2340,7 +2405,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
       evolucao: !isGio ? evolucao.trim() : null,
       observacoes: isGio ? observacoes.trim() : null,
       origem: isGio ? origem || null : null,
-      indicadoPor: isGio && origem === "indicacao" ? indicadoPor.trim() : null,
+      indicadoPor: isGio && showIndicadoPor ? indicadoPor.trim() : null,
       valorOrcado: isGio && valorOrcado !== "" ? Number(valorOrcado) : null,
       valorPago: isGio && valorPago !== "" ? Number(valorPago) : null,
     };
@@ -2450,7 +2515,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
             <div>
               <label className="gec-label">Etapa</label>
               <select className="gec-select" value={etapa} onChange={(e) => setEtapa(e.target.value)}>
-                {LEAD_STAGES.filter((s) => isGio || s.id !== "indicacao_recebida").map((s) => (
+                {LEAD_STAGES.filter((s) => isGio || !INDICACAO_STAGE_IDS.includes(s.id)).map((s) => (
                   <option key={s.id} value={s.id}>{s.label}</option>
                 ))}
               </select>
@@ -2483,13 +2548,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
 
           {isGio && (
             <>
-              {lead?.indicadoPorTecnicoId && (
-                <div style={{ fontSize: 12, color: "var(--accent)", background: "var(--accent-soft)", borderRadius: 8, padding: "8px 10px" }}>
-                  <Stethoscope size={12} style={{ verticalAlign: "-1px", marginRight: 5 }} />
-                  Indicação de {memberName(lead.indicadoPorTecnicoId, team)}
-                </div>
-              )}
-              <div style={{ display: "grid", gridTemplateColumns: origem === "indicacao" ? "1fr 1fr" : "1fr", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: showIndicadoPor ? "1fr 1fr" : "1fr", gap: 12 }}>
                 <div>
                   <label className="gec-label">Origem</label>
                   <select className="gec-select" value={origem} onChange={(e) => setOrigem(e.target.value)}>
@@ -2499,7 +2558,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
                     ))}
                   </select>
                 </div>
-                {origem === "indicacao" && (
+                {showIndicadoPor && (
                   <div>
                     <label className="gec-label">Quem indicou</label>
                     <input className="gec-input" value={indicadoPor} onChange={(e) => setIndicadoPor(e.target.value)} />
@@ -2637,15 +2696,88 @@ function ImportLeadsModal({ onImport, onClose }) {
   );
 }
 
+// ---------- Importar cards de "Indicação Procedimento" na GIO (planilha simples) ----------
+function ImportIndicacaoProcedimentoModal({ onImport, onClose }) {
+  const [parsing, setParsing] = useState(false);
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+
+  function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError("");
+    setResult(null);
+    setParsing(true);
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      try {
+        const data = new Uint8Array(ev.target.result);
+        const wb = XLSX.read(data, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
+        const parsed = parseIndicacaoProcedimentoRows(rows);
+        if (parsed.rows.length === 0) {
+          setError('Não encontrei linhas válidas nesse arquivo (procurei a coluna "Nome do Paciente").');
+          setParsing(false);
+          return;
+        }
+        const summary = await onImport(parsed.rows);
+        const base = summary
+          ? { ...summary, total: parsed.rows.length }
+          : { criados: 0, ignorados: parsed.rows.length, total: parsed.rows.length };
+        setResult(base);
+      } catch (err) {
+        setError("Não consegui ler esse arquivo. Confirme que é uma planilha .xls ou .xlsx com a coluna \"Nome do Paciente\".");
+      } finally {
+        setParsing(false);
+        e.target.value = "";
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  return (
+    <div className="gec-modal-overlay" onClick={onClose}>
+      <div className="gec-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 440 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+          <div className="gec-display" style={{ fontSize: 18, fontWeight: 600 }}>Importar planilha</div>
+          <button className="gec-btn gec-btn-ghost" style={{ padding: 7 }} onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <p style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 14 }}>
+          Suba uma planilha (.xls ou .xlsx) com as colunas "Nome do Paciente" (obrigatória), "WhatsApp", "Procedimento"
+          e "Observações". Cada linha vira um card em "Indicação Procedimento". Pacientes com o mesmo nome e WhatsApp
+          de um card que já existe na GIO são ignorados automaticamente, pra não duplicar.
+        </p>
+        <input type="file" accept=".xls,.xlsx" onChange={handleFile} disabled={parsing} />
+        {parsing && <div style={{ fontSize: 12.5, color: "var(--muted)", marginTop: 10 }}>Importando…</div>}
+        {error && <div style={{ fontSize: 12.5, color: "var(--danger)", marginTop: 10 }}>{error}</div>}
+        {result && (
+          <div style={{ fontSize: 12.5, marginTop: 10 }}>
+            {result.criados} card{result.criados === 1 ? "" : "s"} criado{result.criados === 1 ? "" : "s"}
+            {result.ignorados > 0 ? `, ${result.ignorados} já existia${result.ignorados === 1 ? "" : "m"} e foi${result.ignorados === 1 ? "" : "ram"} ignorado${result.ignorados === 1 ? "" : "s"}` : ""}.
+          </div>
+        )}
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+          <button className="gec-btn gec-btn-primary" onClick={onClose}>Fechar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------- Comercial (kanban de leads/oportunidades) ----------
-function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete, onCreate, onImport, onDelete, onChangeStage, onOpenDetail }) {
+function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete, onCreate, onImport, onImportIndicacaoProcedimento, onDelete, onChangeStage, onOpenDetail }) {
   const [showModal, setShowModal] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showImportGio, setShowImportGio] = useState(false);
   const [filterClinica, setFilterClinica] = useState("todas");
 
   const filtered = leads.filter((l) => (lockedClinicaId ? l.clinicaId === lockedClinicaId : filterClinica === "todas" || l.clinicaId === filterClinica));
   const modalClinica = lockedClinicaId || (filterClinica === "todas" ? CLINICAS[0].id : filterClinica);
   const isSorridentsView = lockedClinicaId ? lockedClinicaId === "sorridents" : filterClinica === "sorridents";
+  const isGioView = lockedClinicaId ? lockedClinicaId === "gio" : filterClinica === "gio";
 
   return (
     <>
@@ -2667,17 +2799,22 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
                 <Upload size={15} /> Importar planilha
               </button>
             )}
+            {isGioView && (
+              <button className="gec-btn gec-btn-ghost" onClick={() => setShowImportGio(true)}>
+                <Upload size={15} /> Importar planilha
+              </button>
+            )}
             <button className="gec-btn gec-btn-primary" onClick={() => setShowModal(true)}>
               <Plus size={15} /> Nova oportunidade
             </button>
           </div>
         </div>
 
-        {filtered.length === 0 ? (
-          <EmptyState icon={Briefcase} title="Nenhuma oportunidade por aqui" subtitle="Crie a primeira oportunidade pra começar o funil." />
-        ) : (
-          <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} hideIndicacaoRecebida={isSorridentsView} />
-        )}
+        {/* O funil sempre aparece com todas as etapas (mesmo sem nenhuma
+            oportunidade ainda) — cada coluna já mostra "Nada aqui" quando
+            vazia, mas a estrutura do funil fica visível pro time desde o
+            início. */}
+        <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} hideIndicacaoStages={isSorridentsView} />
       </div>
 
       {showModal && (
@@ -2693,125 +2830,10 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
       )}
 
       {showImport && <ImportLeadsModal onImport={onImport} onClose={() => setShowImport(false)} />}
-    </>
-  );
-}
-
-// ---------- Indicações do time técnico (GIO): formulário ----------
-function IndicacaoForm({ onCreate }) {
-  const [nomePaciente, setNomePaciente] = useState("");
-  const [procedimento, setProcedimento] = useState("");
-  const [observacao, setObservacao] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [sent, setSent] = useState(false);
-
-  async function submit(e) {
-    e.preventDefault();
-    if (!nomePaciente.trim() || !procedimento.trim()) return;
-    setSubmitting(true);
-    await onCreate({ nomePaciente: nomePaciente.trim(), procedimento: procedimento.trim(), observacao: observacao.trim() });
-    setSubmitting(false);
-    setNomePaciente("");
-    setProcedimento("");
-    setObservacao("");
-    setSent(true);
-    setTimeout(() => setSent(false), 2500);
-  }
-
-  return (
-    <form onSubmit={submit} className="gec-card" style={{ display: "flex", flexDirection: "column", gap: 14, padding: 18, marginBottom: 20 }}>
-      <div>
-        <div className="gec-display" style={{ fontSize: 15, fontWeight: 600 }}>Nova indicação</div>
-        <div style={{ fontSize: 12.5, color: "var(--muted)" }}>
-          A data é registrada automaticamente com o dia de hoje. Ao enviar, a recepção já recebe uma tarefa pra ligar pra esse paciente.
-        </div>
-      </div>
-      <div>
-        <label className="gec-label">Nome do paciente</label>
-        <input className="gec-input" value={nomePaciente} onChange={(e) => setNomePaciente(e.target.value)} required />
-      </div>
-      <div>
-        <label className="gec-label">Procedimento indicado</label>
-        <input className="gec-input" value={procedimento} onChange={(e) => setProcedimento(e.target.value)} required />
-      </div>
-      <div>
-        <label className="gec-label">Observação (opcional)</label>
-        <textarea className="gec-textarea" rows={3} value={observacao} onChange={(e) => setObservacao(e.target.value)} />
-      </div>
-      <button type="submit" className="gec-btn gec-btn-primary" style={{ justifyContent: "center" }} disabled={submitting}>
-        {submitting ? "Enviando…" : sent ? "Indicação enviada ✓" : "Enviar indicação"}
-      </button>
-    </form>
-  );
-}
-
-// ---------- Indicações do time técnico (GIO): histórico ----------
-function IndicacaoRow({ indicacao, lead }) {
-  const stage = lead ? LEAD_STAGES.find((s) => s.id === lead.etapa) : null;
-  return (
-    <div className="gec-card" style={{ padding: 14, display: "flex", flexDirection: "column", gap: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
-        <div style={{ fontWeight: 600, fontSize: 13.5 }}>{indicacao.nomePaciente}</div>
-        <span style={{ fontSize: 11.5, color: "var(--muted)", whiteSpace: "nowrap" }}>{fmtDate(indicacao.dataIndicacao)}</span>
-      </div>
-      <div style={{ fontSize: 12.5, color: "var(--muted)" }}>{indicacao.procedimento}</div>
-      {indicacao.observacao && <div style={{ fontSize: 12, color: "var(--muted)" }}>{indicacao.observacao}</div>}
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {stage && (
-          <span className="gec-pill" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-            {stage.label}
-          </span>
-        )}
-        {lead?.valorPago && (
-          <span className="gec-pill" style={{ background: "var(--success-soft)", color: "var(--success)" }}>
-            <DollarSign size={11} /> Pago: {fmtMoney(lead.valorPago)}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------- Indicações do time técnico (GIO): mini dashboard do mês ----------
-function IndicacoesDashboard({ indicacoes, leadsById }) {
-  const mesAtual = todayISO().slice(0, 7);
-  const doMes = indicacoes.filter((i) => (i.dataIndicacao || "").slice(0, 7) === mesAtual);
-  const totalPago = doMes.reduce((sum, i) => sum + (Number(leadsById[i.leadId]?.valorPago) || 0), 0);
-  return (
-    <div className="gec-card" style={{ padding: 16, marginBottom: 20, display: "flex", gap: 24, flexWrap: "wrap" }}>
-      <div>
-        <div style={{ fontSize: 11.5, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".03em" }}>Indicações este mês</div>
-        <div className="gec-display" style={{ fontSize: 22, fontWeight: 700 }}>{doMes.length}</div>
-      </div>
-      <div>
-        <div style={{ fontSize: 11.5, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".03em" }}>Pago este mês</div>
-        <div className="gec-display" style={{ fontSize: 22, fontWeight: 700, color: "var(--success)" }}>{fmtMoney(totalPago) || "R$ 0,00"}</div>
-      </div>
-    </div>
-  );
-}
-
-// ---------- Indicações do time técnico (GIO): tela principal ----------
-function IndicacoesView({ indicacoes, leads, onCreate }) {
-  const leadsById = {};
-  leads.forEach((l) => {
-    leadsById[l.id] = l;
-  });
-  return (
-    <div className="gec-fade-in">
-      <IndicacaoForm onCreate={onCreate} />
-      <IndicacoesDashboard indicacoes={indicacoes} leadsById={leadsById} />
-      <div className="gec-display" style={{ fontSize: 14, fontWeight: 600, marginBottom: 10 }}>Suas indicações</div>
-      {indicacoes.length === 0 ? (
-        <EmptyState icon={Stethoscope} title="Nenhuma indicação enviada ainda" subtitle="As indicações que você enviar aparecem aqui." />
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {indicacoes.map((i) => (
-            <IndicacaoRow key={i.id} indicacao={i} lead={leadsById[i.leadId]} />
-          ))}
-        </div>
+      {showImportGio && (
+        <ImportIndicacaoProcedimentoModal onImport={onImportIndicacaoProcedimento} onClose={() => setShowImportGio(false)} />
       )}
-    </div>
+    </>
   );
 }
 
@@ -2944,8 +2966,19 @@ function COBRANCA_LABEL(formaPagamento) {
   return formaPagamento === "boleto" ? "Boleto" : "Recorrente";
 }
 
+// Cor/estilo do pill de "próximo vencimento", por status de proximoVencimentoInfo.
+const VENCIMENTO_PILL_STYLE = {
+  atrasada: { background: "var(--danger-soft)", color: "var(--danger)" },
+  hoje: { background: "var(--warning-soft)", color: "var(--warning)" },
+  amanha: { background: "var(--warning-soft)", color: "var(--warning)" },
+  futura: { background: "#EAEDEA", color: "var(--muted)" },
+  paga: { background: "var(--success-soft)", color: "var(--success)" },
+  quitada: { background: "var(--success-soft)", color: "var(--success)" },
+  inativa: { background: "#EAEDEA", color: "var(--muted)" },
+};
+
 // ---------- Cobranças da GIO: linha de um cliente ----------
-function CobrancaRow({ cobranca, onEdit, tarefaAtual, onMarkPaid, onUndoPaid }) {
+function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPaid }) {
   // Mesma cor de fundo das tarefas/leads, olhando a tarefa de cobrança do
   // ciclo atual: atrasada (venceu e ainda não foi gerada/concluída) fica
   // vermelho leve, vencendo hoje fica amarelo leve, senão neutro — inclusive
@@ -2966,12 +2999,14 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, onMarkPaid, onUndoPaid }) 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
         <div style={{ fontWeight: 600, fontSize: 13.5 }}>{cobranca.nomeCliente}</div>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-          {!cobranca.ativo && (
-            <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>Inativa</span>
-          )}
           <span className="gec-pill" style={{ background: "var(--primary-soft)", color: "var(--primary-dark)" }}>
             <CreditCard size={11} /> {COBRANCA_LABEL(cobranca.formaPagamento)} · dia {cobranca.diaVencimento}
           </span>
+          {info && (
+            <span className="gec-pill" style={VENCIMENTO_PILL_STYLE[info.status] || {}}>
+              <Clock size={11} /> {info.label}
+            </span>
+          )}
         </div>
       </div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", flexDirection: "column", gap: 3 }}>
@@ -2994,7 +3029,8 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, onMarkPaid, onUndoPaid }) 
           </span>
         )}
         <span>
-          {cobranca.valorParcela ? fmtMoney(cobranca.valorParcela) : "—"} · parcela {cobranca.parcelasPagas} de {cobranca.numeroParcelas}
+          {cobranca.valorParcela ? fmtMoney(cobranca.valorParcela) : "—"} · {cobranca.parcelasPagas} de {cobranca.numeroParcelas} parcelas pagas
+          {cobranca.numeroParcelas - cobranca.parcelasPagas > 0 && ` (faltam ${cobranca.numeroParcelas - cobranca.parcelasPagas})`}
         </span>
         {cobranca.observacoes && <span>{cobranca.observacoes}</span>}
       </div>
@@ -3037,23 +3073,19 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, onMarkPaid, onUndoPaid }) 
 }
 
 // ---------- Cobranças da GIO: mini dashboard com visão geral ----------
-function CobrancasDashboard({ cobrancas }) {
+function CobrancasDashboard({ cobrancas, tasks }) {
   const hoje = todayISO();
   const ativas = cobrancas.filter((c) => c.ativo);
   const totalEsperadoMes = ativas.reduce((sum, c) => sum + (Number(c.valorParcela) || 0), 0);
   const boletos = ativas.filter((c) => c.formaPagamento === "boleto").length;
   const recorrentes = ativas.length - boletos;
-  const vencendoEmBreve = ativas.filter((c) => {
-    const venc = dueDateThisCycle(c.diaVencimento, hoje);
-    const diff = daysBetweenISO(hoje, venc);
-    return diff >= 0 && diff <= 7;
-  }).length;
-  const vencendoHoje = ativas.filter((c) => dueDateThisCycle(c.diaVencimento, hoje) === hoje).length;
-  // "Em atraso": o vencimento desse ciclo já passou e a cobrança ainda não
-  // gerou a tarefa correspondente (senão parcelasPagas já teria avançado) —
-  // sinaliza um caso que a checagem automática ainda não pegou (app não foi
-  // aberto a tempo, ou já passou da janela de tolerância de 6 dias).
-  const emAtraso = ativas.filter((c) => daysBetweenISO(hoje, dueDateThisCycle(c.diaVencimento, hoje)) < 0).length;
+  // Usa o mesmo cálculo de "próximo vencimento" exibido em cada card, pra
+  // não contar como atrasada/vencendo uma cobrança cujo ciclo atual já foi
+  // marcado como paga (senão o número aqui bate menos que a lista abaixo).
+  const infos = ativas.map((c) => proximoVencimentoInfo(c, tarefaAtualDaCobranca(tasks, c.id), hoje));
+  const vencendoEmBreve = infos.filter((i) => i.dias !== null && i.dias >= 0 && i.dias <= 7 && i.status !== "paga" && i.status !== "quitada").length;
+  const vencendoHoje = infos.filter((i) => i.status === "hoje").length;
+  const emAtraso = infos.filter((i) => i.status === "atrasada").length;
 
   return (
     <div className="gec-card" style={{ padding: 16, marginBottom: 20, display: "flex", gap: 24, flexWrap: "wrap" }}>
@@ -3085,27 +3117,46 @@ function CobrancasDashboard({ cobrancas }) {
   );
 }
 
+// Ordem de urgência pra lista de cobranças — atrasada primeiro, inativa por
+// último, independente do dia de vencimento cadastrado.
+const VENCIMENTO_STATUS_RANK = { atrasada: 0, hoje: 1, amanha: 2, futura: 3, paga: 4, quitada: 5, inativa: 6 };
+
 // ---------- Cobranças da GIO: lista ----------
 function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDelete, onMarkPaid, onUndoPaid }) {
   const [showModal, setShowModal] = useState(false);
   const [editTarget, setEditTarget] = useState(null);
+  const [filtroForma, setFiltroForma] = useState("todas");
+  const [mostrarInativas, setMostrarInativas] = useState(false);
 
-  const ordenadas = [...cobrancas].sort((a, b) => {
-    if (a.ativo !== b.ativo) return a.ativo ? -1 : 1;
-    return (a.diaVencimento || 0) - (b.diaVencimento || 0);
+  const hoje = todayISO();
+
+  // Cada cobrança já sai com a tarefa do ciclo atual e o resumo do próximo
+  // vencimento calculados uma vez só, reaproveitados pro filtro, pra
+  // ordenação e pro card.
+  const enriquecidas = cobrancas.map((c) => {
+    const tarefaAtual = tarefaAtualDaCobranca(tasks, c.id);
+    return { cobranca: c, tarefaAtual, info: proximoVencimentoInfo(c, tarefaAtual, hoje) };
   });
 
-  // Pra cada cobrança, a tarefa de cobrança do ciclo mais recente (qualquer
-  // status) — dá o botão "Marcar como paga" (se ainda pendente) ou "Desfazer"
-  // (se já foi marcada) direto no card, sem precisar abrir a tarefa.
-  function tarefaAtual(cobrancaId) {
-    const doCliente = (tasks || []).filter((t) => t.cobrancaId === cobrancaId).sort((a, b) => (b.prazo || "").localeCompare(a.prazo || ""));
-    return doCliente[0] || null;
-  }
+  const filtradas = enriquecidas.filter(({ cobranca }) => {
+    if (filtroForma !== "todas" && cobranca.formaPagamento !== filtroForma) return false;
+    if (!mostrarInativas && !cobranca.ativo) return false;
+    return true;
+  });
+
+  const ordenadas = [...filtradas].sort((a, b) => {
+    const rankA = VENCIMENTO_STATUS_RANK[a.info.status] ?? 9;
+    const rankB = VENCIMENTO_STATUS_RANK[b.info.status] ?? 9;
+    if (rankA !== rankB) return rankA - rankB;
+    if (a.info.dias !== null && b.info.dias !== null && a.info.dias !== b.info.dias) return a.info.dias - b.info.dias;
+    return (a.cobranca.nomeCliente || "").localeCompare(b.cobranca.nomeCliente || "");
+  });
+
+  const inativasEscondidas = !mostrarInativas && cobrancas.some((c) => !c.ativo);
 
   return (
     <div className="gec-fade-in">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 12.5, color: "var(--muted)", maxWidth: 480 }}>
           Cadastro dos clientes em boleto ou cartão recorrente. O Pulso cria sozinho a tarefa de cobrança pra gerente da GIO perto de cada vencimento.
         </div>
@@ -3114,14 +3165,35 @@ function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDele
         </button>
       </div>
 
-      <CobrancasDashboard cobrancas={cobrancas} />
+      <CobrancasDashboard cobrancas={cobrancas} tasks={tasks} />
 
-      {ordenadas.length === 0 ? (
+      {cobrancas.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+          <select className="gec-select" style={{ maxWidth: 200 }} value={filtroForma} onChange={(e) => setFiltroForma(e.target.value)}>
+            <option value="todas">Todas as formas</option>
+            <option value="boleto">Só boleto</option>
+            <option value="recorrente">Só recorrente</option>
+          </select>
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "var(--muted)", cursor: "pointer" }}>
+            <input type="checkbox" checked={mostrarInativas} onChange={(e) => setMostrarInativas(e.target.checked)} />
+            Mostrar inativas
+          </label>
+          {inativasEscondidas && (
+            <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+              {cobrancas.filter((c) => !c.ativo).length} inativa(s) escondida(s)
+            </span>
+          )}
+        </div>
+      )}
+
+      {cobrancas.length === 0 ? (
         <EmptyState icon={CreditCard} title="Nenhuma cobrança cadastrada ainda" subtitle="Cadastre um cliente em boleto ou recorrente pra começar o controle." />
+      ) : ordenadas.length === 0 ? (
+        <EmptyState icon={CreditCard} title="Nenhuma cobrança encontrada" subtitle="Ajuste os filtros acima pra ver outras cobranças." />
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {ordenadas.map((c) => (
-            <CobrancaRow key={c.id} cobranca={c} onEdit={setEditTarget} tarefaAtual={tarefaAtual(c.id)} onMarkPaid={onMarkPaid} onUndoPaid={onUndoPaid} />
+          {ordenadas.map(({ cobranca: c, tarefaAtual, info }) => (
+            <CobrancaRow key={c.id} cobranca={c} onEdit={setEditTarget} tarefaAtual={tarefaAtual} info={info} onMarkPaid={onMarkPaid} onUndoPaid={onUndoPaid} />
           ))}
         </div>
       )}
@@ -3566,7 +3638,6 @@ export default function PulsoApp() {
   const [activity, setActivity] = useState([]);
   const [leads, setLeads] = useState([]);
   const [estoque, setEstoque] = useState([]);
-  const [indicacoes, setIndicacoes] = useState([]);
   const [cobrancas, setCobrancas] = useState([]);
   const [view, setView] = useState("painel");
   const [ownerClinicView, setOwnerClinicView] = useState("todas");
@@ -3646,11 +3717,6 @@ export default function PulsoApp() {
     if (!error && data) setEstoque(data.map(mapEstoqueItem));
   }, []);
 
-  const fetchIndicacoes = useCallback(async () => {
-    const { data, error } = await supabase.from("indicacoes").select("*").order("criado_em", { ascending: false });
-    if (!error && data) setIndicacoes(data.map(mapIndicacao));
-  }, []);
-
   const fetchCobrancas = useCallback(async () => {
     const { data, error } = await supabase.from("cobrancas").select("*").order("dia_vencimento");
     if (!error && data) setCobrancas(data.map(mapCobranca));
@@ -3676,10 +3742,10 @@ export default function PulsoApp() {
       setProfileLoading(true);
       const p = await fetchProfile(session.user.id);
       setProfile(p);
-      if (p) await Promise.all([fetchTeam(), fetchTasks(), fetchAttachments(), fetchComments(), fetchChecklist(), fetchActivity(), fetchLeads(), fetchEstoque(), fetchIndicacoes(), fetchCobrancas()]);
+      if (p) await Promise.all([fetchTeam(), fetchTasks(), fetchAttachments(), fetchComments(), fetchChecklist(), fetchActivity(), fetchLeads(), fetchEstoque(), fetchCobrancas()]);
       setProfileLoading(false);
     })();
-  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchIndicacoes, fetchCobrancas]);
+  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchCobrancas]);
 
   useEffect(() => {
     if (!profile) return;
@@ -3693,13 +3759,12 @@ export default function PulsoApp() {
       .on("postgres_changes", { event: "*", schema: "public", table: "task_activity" }, () => fetchActivity())
       .on("postgres_changes", { event: "*", schema: "public", table: "leads" }, () => fetchLeads())
       .on("postgres_changes", { event: "*", schema: "public", table: "estoque_itens" }, () => fetchEstoque())
-      .on("postgres_changes", { event: "*", schema: "public", table: "indicacoes" }, () => fetchIndicacoes())
       .on("postgres_changes", { event: "*", schema: "public", table: "cobrancas" }, () => fetchCobrancas())
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchIndicacoes, fetchCobrancas]);
+  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchCobrancas]);
 
   const uploadAttachment = useCallback(
     async (task, file) => {
@@ -4033,22 +4098,52 @@ export default function PulsoApp() {
     [leads, profile, fetchLeads]
   );
 
-  const handleCreateIndicacao = useCallback(
-    async (patch) => {
-      const { error } = await supabase.from("indicacoes").insert({
-        tecnico_id: profile?.id,
-        nome_paciente: patch.nomePaciente,
-        procedimento: patch.procedimento,
-        observacao: patch.observacao || null,
-      });
-      if (error) setError("Não foi possível enviar a indicação: " + error.message);
-      else {
-        fetchIndicacoes();
-        fetchLeads();
-        fetchTasks();
+  // Chave de duplicidade pra importação da GIO: nome + WhatsApp normalizados
+  // (a GIO não usa código de paciente como a Sorridents). Duas linhas sem
+  // WhatsApp com o mesmo nome também contam como duplicata.
+  function dedupKeyNomeWhatsapp(nome, whatsapp) {
+    const normNome = String(nome || "").trim().toLowerCase().replace(/\s+/g, " ");
+    const normWhatsapp = String(whatsapp || "").replace(/\D/g, "");
+    return `${normNome}|${normWhatsapp}`;
+  }
+
+  const handleImportIndicacaoProcedimento = useCallback(
+    async (rows) => {
+      // Verifica duplicidade contra QUALQUER card da GIO (não só os que já
+      // estão em "Indicação Procedimento") — se a pessoa já avançou de
+      // etapa, reimportar a planilha não deve criar um card novo do zero.
+      const vistos = new Set(
+        leads.filter((l) => l.clinicaId === "gio").map((l) => dedupKeyNomeWhatsapp(l.nomePaciente, l.whatsapp))
+      );
+      const novos = [];
+      for (const r of rows) {
+        if (!r.nomePaciente) continue;
+        const key = dedupKeyNomeWhatsapp(r.nomePaciente, r.whatsapp);
+        if (vistos.has(key)) continue;
+        vistos.add(key);
+        novos.push(r);
       }
+      if (novos.length === 0) return { criados: 0, ignorados: rows.length };
+      const payload = novos.map((r) => ({
+        ...leadPatchToRow({
+          clinicaId: "gio",
+          nomePaciente: r.nomePaciente,
+          whatsapp: r.whatsapp || null,
+          etapa: "indicacao_procedimento",
+          procedimento: r.procedimento || null,
+          observacoes: r.observacoes || null,
+        }),
+        criado_por: profile?.id,
+      }));
+      const { error } = await supabase.from("leads").insert(payload);
+      if (error) {
+        setError("Não foi possível importar a planilha: " + error.message);
+        return null;
+      }
+      await fetchLeads();
+      return { criados: novos.length, ignorados: rows.length - novos.length };
     },
-    [profile, fetchIndicacoes, fetchLeads, fetchTasks]
+    [leads, profile, fetchLeads]
   );
 
   // Só inclui uma coluna se a chave correspondente veio no patch — assim um
@@ -4356,7 +4451,6 @@ export default function PulsoApp() {
 
   const isGerente = user.role === "gerente";
   const isBase = user.role === "base";
-  const isTecnico = user.role === "tecnico";
   const canManage = isOwner || isGerente;
 
   const staffTeam = team.filter((m) => m.role !== "owner");
@@ -4386,8 +4480,7 @@ export default function PulsoApp() {
   const vePraSorridents = user.clinicaId === "sorridents";
 
   // Aba de Cobranças (boleto/recorrente): só existe pra GIO — gestor sempre
-  // vê, gerente/base só se forem da GIO. Técnica nunca vê (fica de fora por
-  // omissão, igual às outras abas administrativas).
+  // vê, gerente/base só se forem da GIO.
   const cobrancasTab = { id: "cobrancas", label: "Cobranças", icon: CreditCard };
   const vePraGio = user.clinicaId === "gio";
 
@@ -4412,8 +4505,6 @@ export default function PulsoApp() {
         ...(vePraSorridents ? [limpezaTab] : []),
         ...(vePraGio ? [cobrancasTab] : []),
       ]
-    : isTecnico
-    ? [{ id: "indicacoes", label: "Indicações", icon: Stethoscope }]
     : [
         { id: "minhas", label: "Minhas tarefas", icon: ClipboardList },
         { id: "comercial", label: "Comercial", icon: Briefcase },
@@ -4579,6 +4670,7 @@ export default function PulsoApp() {
             canDelete={canManage}
             onCreate={handleCreateLead}
             onImport={handleImportLeads}
+            onImportIndicacaoProcedimento={handleImportIndicacaoProcedimento}
             onChangeStage={handleChangeLeadStage}
             onDelete={handleDeleteLead}
             onOpenDetail={setDetailLead}
@@ -4611,10 +4703,6 @@ export default function PulsoApp() {
             onDeleteItem={handleDeleteEstoqueItem}
             onSolicitarPedido={handleSolicitarPedido}
           />
-        )}
-
-        {isTecnico && activeView === "indicacoes" && (
-          <IndicacoesView indicacoes={indicacoes} leads={leads} onCreate={handleCreateIndicacao} />
         )}
 
         {activeView === "cobrancas" && (
