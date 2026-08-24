@@ -2130,7 +2130,7 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
         value={lead.etapa}
         onChange={(e) => onChangeStage(lead.id, e.target.value)}
       >
-        {LEAD_STAGES.map((s) => (
+        {LEAD_STAGES.filter((s) => isGio || s.id !== "indicacao_recebida").map((s) => (
           <option key={s.id} value={s.id}>{s.label}</option>
         ))}
       </select>
@@ -2149,10 +2149,11 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
 }
 
 // ---------- Kanban comercial: board horizontal com as 8 etapas ----------
-function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete }) {
+function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete, hideIndicacaoRecebida = false }) {
+  const stages = hideIndicacaoRecebida ? LEAD_STAGES.filter((s) => s.id !== "indicacao_recebida") : LEAD_STAGES;
   return (
     <div className="gec-scrollbar" style={{ display: "flex", gap: 14, overflowX: "auto", paddingBottom: 8, alignItems: "flex-start" }}>
-      {LEAD_STAGES.map((stage) => {
+      {stages.map((stage) => {
         const stageLeads = leads
           .filter((l) => l.etapa === stage.id)
           .slice()
@@ -2404,7 +2405,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
             <div>
               <label className="gec-label">Etapa</label>
               <select className="gec-select" value={etapa} onChange={(e) => setEtapa(e.target.value)}>
-                {LEAD_STAGES.map((s) => (
+                {LEAD_STAGES.filter((s) => isGio || s.id !== "indicacao_recebida").map((s) => (
                   <option key={s.id} value={s.id}>{s.label}</option>
                 ))}
               </select>
@@ -2630,7 +2631,7 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
         {filtered.length === 0 ? (
           <EmptyState icon={Briefcase} title="Nenhuma oportunidade por aqui" subtitle="Crie a primeira oportunidade pra começar o funil." />
         ) : (
-          <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} />
+          <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} hideIndicacaoRecebida={isSorridentsView} />
         )}
       </div>
 
