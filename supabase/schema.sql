@@ -10,7 +10,7 @@
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   nome text not null,
-  role text not null check (role in ('owner','gerente','base','tecnico')),
+  role text not null check (role in ('owner','gerente','base')),
   clinica_id text check (clinica_id in ('sorridents','gio')),
   login_email text not null unique,
   created_at timestamptz not null default now()
@@ -33,10 +33,12 @@ create table if not exists public.tasks (
   categoria text
 );
 
--- Garante o papel "tecnico" mesmo se a tabela profiles já existia de uma
--- versão anterior sem ele (time técnico da GIO, aba de indicações)
+-- O papel "tecnico" (time técnico da GIO, aba de indicações) foi removido:
+-- as indicações passaram a ser trabalhadas direto no funil do Comercial.
+-- Garante o check sem ele mesmo se a tabela já existia de uma versão
+-- anterior que ainda o permitia.
 alter table public.profiles drop constraint if exists profiles_role_check;
-alter table public.profiles add constraint profiles_role_check check (role in ('owner','gerente','base','tecnico'));
+alter table public.profiles add constraint profiles_role_check check (role in ('owner','gerente','base'));
 
 -- Garante as colunas novas mesmo se a tabela já existia de uma versão anterior
 alter table public.tasks add column if not exists recorrencia jsonb;
@@ -377,7 +379,7 @@ create table if not exists public.leads (
   id uuid primary key default gen_random_uuid(),
   clinica_id text not null check (clinica_id in ('sorridents','gio')),
   etapa text not null default 'avaliacao_agendada' check (etapa in (
-    'indicacao_recebida','avaliacao_agendada','faltou_avaliacao','orcamento_apresentado','negociacao',
+    'indicacao_procedimento','indicacao_cliente','avaliacao_agendada','faltou_avaliacao','orcamento_apresentado','negociacao',
     'follow_up','aguardando_pagamento','fechado','perdido'
   )),
   nome_paciente text not null,
@@ -394,7 +396,6 @@ create table if not exists public.leads (
   prioridade text check (prioridade in ('alta','media','baixa')),
   historia text,
   evolucao text,
-  indicado_por_tecnico_id uuid references public.profiles(id),
   observacoes text,
   criado_por uuid references public.profiles(id),
   criado_em timestamptz not null default now()
@@ -402,49 +403,54 @@ create table if not exists public.leads (
 
 -- Garante as colunas mesmo se a tabela já existia de uma versão anterior
 alter table public.leads add column if not exists proximo_contato date;
-alter table public.leads add column if not exists indicado_por_tecnico_id uuid references public.profiles(id);
 alter table public.leads add column if not exists observacoes text;
 alter table public.leads add column if not exists evolucao text;
 
--- Garante a etapa "indicacao_recebida" (indicações do time técnico da GIO)
--- mesmo se a tabela já existia com o check antigo
+-- Etapas de indicação do funil da GIO: "indicacao_recebida" virou
+-- "indicacao_procedimento" (indicação de procedimento, trabalhada direto
+-- pelo time comercial) e ganhou a irmã "indicacao_cliente" (quando uma
+-- cliente indica uma amiga pra tratamento). Solta o check antigo primeiro
+-- (ele não reconhece o valor novo, então migrar os dados antes travaria) e
+-- só recoloca a trava — já com os nomes novos — depois de migrar os dados.
 alter table public.leads drop constraint if exists leads_etapa_check;
+update public.leads set etapa = 'indicacao_procedimento' where etapa = 'indicacao_recebida';
 alter table public.leads add constraint leads_etapa_check check (etapa in (
-  'indicacao_recebida','avaliacao_agendada','faltou_avaliacao','orcamento_apresentado','negociacao',
+  'indicacao_procedimento','indicacao_cliente','avaliacao_agendada','faltou_avaliacao','orcamento_apresentado','negociacao',
   'follow_up','aguardando_pagamento','fechado','perdido'
 ));
 
 alter table public.leads enable row level security;
 
--- Técnico só enxerga os leads que ele mesmo indicou (pra alimentar o "valor
--- pago" na aba Indicações) — nunca a carteira inteira da clínica.
 drop policy if exists "leads_select" on public.leads;
 create policy "leads_select" on public.leads for select to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
-  or (public.my_role() = 'tecnico' and indicado_por_tecnico_id = (select auth.uid()))
+  or public.my_clinica() = clinica_id
 );
 
--- Técnico nunca cria/edita lead direto: quando ele manda uma indicação, é o
--- gatilho de public.indicacoes (SECURITY DEFINER) que cria o card por ele.
 drop policy if exists "leads_insert" on public.leads;
 create policy "leads_insert" on public.leads for insert to authenticated
 with check (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 );
 
 drop policy if exists "leads_update" on public.leads;
 create policy "leads_update" on public.leads for update to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 )
 with check (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 );
+
+-- Coluna do antigo fluxo de indicação do time técnico — removida junto com
+-- o papel "tecnico". Só depois de redefinir as policies acima (a
+-- "leads_select" de uma instalação anterior referenciava essa coluna, então
+-- dropá-la antes quebraria por dependência).
+alter table public.leads drop column if exists indicado_por_tecnico_id;
 
 drop policy if exists "leads_delete" on public.leads;
 create policy "leads_delete" on public.leads for delete to authenticated
@@ -480,12 +486,11 @@ alter table public.estoque_itens add constraint estoque_itens_tipo_check check (
 alter table public.estoque_itens enable row level security;
 
 -- Todo mundo da clínica (base, gerente) e o gestor podem ver os itens.
--- Técnico não tem nenhum acesso ao estoque (nem consulta) — não usa essa aba.
 drop policy if exists "estoque_select" on public.estoque_itens;
 create policy "estoque_select" on public.estoque_itens for select to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 );
 
 -- Só gestor e gerente da clínica podem cadastrar item novo.
@@ -498,17 +503,16 @@ with check (
 
 -- Gestor e gerente editam tudo; papel-base da clínica também pode
 -- atualizar a linha (é o que os botões de +/- usam) — o trigger abaixo
--- trava pra ele só conseguir mexer em quantidade_atual. Técnico não edita
--- nada aqui.
+-- trava pra ele só conseguir mexer em quantidade_atual.
 drop policy if exists "estoque_update" on public.estoque_itens;
 create policy "estoque_update" on public.estoque_itens for update to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 )
 with check (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = clinica_id)
+  or public.my_clinica() = clinica_id
 );
 
 drop policy if exists "estoque_delete" on public.estoque_itens;
@@ -545,99 +549,14 @@ create trigger estoque_before_update
 before update on public.estoque_itens
 for each row execute function public.estoque_check_update();
 
--- Indicações do time técnico (só GIO): a menina do time técnico registra o
--- nome do paciente, o procedimento indicado e uma observação opcional; a
--- data é sempre a do dia do envio. Cada indicação, ao ser inserida, cria
--- sozinha (via trigger) um card novo no comercial da GIO (etapa "indicação
--- recebida") e uma tarefa pra gerente da GIO ligar pro paciente.
-create table if not exists public.indicacoes (
-  id uuid primary key default gen_random_uuid(),
-  clinica_id text not null default 'gio' check (clinica_id = 'gio'),
-  tecnico_id uuid not null references public.profiles(id),
-  nome_paciente text not null,
-  procedimento text not null,
-  observacao text,
-  data_indicacao date not null default current_date,
-  lead_id uuid references public.leads(id),
-  criado_em timestamptz not null default now()
-);
-
-alter table public.indicacoes enable row level security;
-
--- Dono vê tudo; gerente da GIO vê tudo da GIO; cada técnica só vê as
--- próprias indicações.
-drop policy if exists "indicacoes_select" on public.indicacoes;
-create policy "indicacoes_select" on public.indicacoes for select to authenticated
-using (
-  public.my_role() = 'owner'
-  or (public.my_role() = 'gerente' and public.my_clinica() = 'gio')
-  or tecnico_id = (select auth.uid())
-);
-
--- Técnica só cria indicação em nome dela mesma; dono e gerente da GIO
--- também podem registrar em nome de alguém do time se precisar.
-drop policy if exists "indicacoes_insert" on public.indicacoes;
-create policy "indicacoes_insert" on public.indicacoes for insert to authenticated
-with check (
-  public.my_role() = 'owner'
-  or (public.my_role() = 'gerente' and public.my_clinica() = 'gio')
-  or (public.my_role() = 'tecnico' and tecnico_id = (select auth.uid()))
-);
-
--- Indicação é um registro histórico — não tem edição, só exclusão (por
--- engano) pelo dono ou gerente da GIO.
-drop policy if exists "indicacoes_delete" on public.indicacoes;
-create policy "indicacoes_delete" on public.indicacoes for delete to authenticated
-using (
-  public.my_role() = 'owner'
-  or (public.my_role() = 'gerente' and public.my_clinica() = 'gio')
-);
-
--- Ao inserir uma indicação: cria o card no comercial da GIO (etapa
--- "indicação recebida", já linkando quem indicou pra comissão futura) e
--- uma tarefa pra gerente da GIO ligar pro paciente — tudo automático.
-create or replace function public.indicacao_processar()
-returns trigger
-language plpgsql
-security definer set search_path = public as $$
-declare
-  v_lead_id uuid;
-  v_gerente_id uuid;
-  v_tecnico_nome text;
-begin
-  select nome into v_tecnico_nome from public.profiles where id = new.tecnico_id;
-
-  insert into public.leads (
-    clinica_id, etapa, nome_paciente, procedimento,
-    indicado_por_tecnico_id, observacoes, criado_por
-  ) values (
-    'gio', 'indicacao_recebida', new.nome_paciente, new.procedimento,
-    new.tecnico_id, new.observacao, new.tecnico_id
-  ) returning id into v_lead_id;
-
-  select id into v_gerente_id from public.profiles
-  where role = 'gerente' and clinica_id = 'gio' limit 1;
-
-  if v_gerente_id is not null then
-    insert into public.tasks (
-      titulo, descricao, clinica_id, responsavel_id, status, prazo, criado_por, categoria
-    ) values (
-      'Ligar pra ' || new.nome_paciente || ' (indicação do time técnico)',
-      'Indicado(a) por ' || coalesce(v_tecnico_nome, 'time técnico') || ' para ' || new.procedimento || '.'
-        || case when coalesce(new.observacao, '') <> '' then ' Observação: ' || new.observacao else '' end,
-      'gio', v_gerente_id, 'pendente', current_date, new.tecnico_id, 'atendimento'
-    );
-  end if;
-
-  new.lead_id = v_lead_id;
-  return new;
-end;
-$$;
-
-drop trigger if exists indicacao_before_insert on public.indicacoes;
-create trigger indicacao_before_insert
-before insert on public.indicacoes
-for each row execute function public.indicacao_processar();
+-- O fluxo de indicações do time técnico (tabela public.indicacoes, com
+-- gatilho que criava um lead automaticamente) foi removido: a GIO passou a
+-- trabalhar indicação de procedimento e indicação de cliente direto no
+-- funil do Comercial (etapas "Indicação Procedimento" e "Indicação
+-- Cliente"). Idempotente: remove tabela/gatilho/função de uma instalação
+-- anterior que ainda os tenha.
+drop table if exists public.indicacoes cascade;
+drop function if exists public.indicacao_processar();
 
 -- Código de paciente não pode se repetir dentro da mesma clínica (a GIO não
 -- usa esse campo, então fica de fora sozinha por ser sempre null). Ignora
@@ -659,11 +578,10 @@ alter table public.estoque_itens drop constraint if exists estoque_itens_quantid
 alter table public.estoque_itens add constraint estoque_itens_quantidade_atual_check check (quantidade_atual >= 0);
 
 -- Índices nas colunas mais consultadas (clínica+etapa dos leads, responsável
--- das tarefas, técnico das indicações) — sem efeito no uso de hoje, mas
--- evita que as telas fiquem lentas conforme o histórico crescer.
+-- das tarefas) — sem efeito no uso de hoje, mas evita que as telas fiquem
+-- lentas conforme o histórico crescer.
 create index if not exists idx_leads_clinica_etapa on public.leads (clinica_id, etapa);
 create index if not exists idx_tasks_responsavel on public.tasks (responsavel_id);
-create index if not exists idx_indicacoes_tecnico on public.indicacoes (tecnico_id);
 
 -- Desligamento de funcionária: quando o perfil dela é apagado (ex: painel do
 -- Supabase, Authentication > Users > Delete — o que cascade-apaga o perfil
@@ -671,7 +589,7 @@ create index if not exists idx_indicacoes_tecnico on public.indicacoes (tecnico_
 -- supervisor acima dela (gerente da clínica dela; se ela já era gerente, ou
 -- se a clínica não tem gerente cadastrada, cai pro dono) — em vez de apagar
 -- as tarefas dela em cascata sem avisar, ou travar com erro por causa de
--- leads/comentários/indicações que ela deixou. Registros que são só
+-- leads/comentários que ela deixou. Registros que são só
 -- histórico de autoria (quem comentou, quem criou) ficam "sem autor": o
 -- registro em si continua existindo, só perde o vínculo com quem já não faz
 -- mais parte da equipe.
@@ -686,7 +604,7 @@ begin
   end if;
 
   select id into v_supervisor from public.profiles
-  where role = 'gerente' and clinica_id = old.clinica_id and old.role in ('base', 'tecnico')
+  where role = 'gerente' and clinica_id = old.clinica_id and old.role = 'base'
   limit 1;
 
   if v_supervisor is null then
@@ -696,11 +614,9 @@ begin
   if v_supervisor is not null then
     update public.tasks set responsavel_id = v_supervisor where responsavel_id = old.id;
     update public.leads set responsavel_comercial = v_supervisor where responsavel_comercial = old.id;
-    update public.indicacoes set tecnico_id = v_supervisor where tecnico_id = old.id;
   end if;
 
   update public.tasks set criado_por = null where criado_por = old.id;
-  update public.leads set indicado_por_tecnico_id = null where indicado_por_tecnico_id = old.id;
   update public.leads set criado_por = null where criado_por = old.id;
   update public.estoque_itens set criado_por = null where criado_por = old.id;
   update public.task_attachments set uploaded_by = null where uploaded_by = old.id;
@@ -743,31 +659,30 @@ alter table public.cobrancas add constraint cobrancas_valor_parcela_check check 
 
 alter table public.cobrancas enable row level security;
 
--- Mesmo padrão de acesso do resto da GIO: técnico nunca vê (não tem relação
--- com o funil comercial), gestor sempre vê, gerente/base da GIO veem tudo.
+-- Gestor sempre vê, gerente/base da GIO veem tudo.
 drop policy if exists "cobrancas_select" on public.cobrancas;
 create policy "cobrancas_select" on public.cobrancas for select to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = 'gio')
+  or public.my_clinica() = 'gio'
 );
 
 drop policy if exists "cobrancas_insert" on public.cobrancas;
 create policy "cobrancas_insert" on public.cobrancas for insert to authenticated
 with check (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = 'gio')
+  or public.my_clinica() = 'gio'
 );
 
 drop policy if exists "cobrancas_update" on public.cobrancas;
 create policy "cobrancas_update" on public.cobrancas for update to authenticated
 using (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = 'gio')
+  or public.my_clinica() = 'gio'
 )
 with check (
   public.my_role() = 'owner'
-  or (public.my_role() <> 'tecnico' and public.my_clinica() = 'gio')
+  or public.my_clinica() = 'gio'
 );
 
 drop policy if exists "cobrancas_delete" on public.cobrancas;
@@ -789,6 +704,64 @@ alter table public.tasks add column if not exists cobranca_id uuid references pu
 -- tarefa; essa constraint garante que só uma sobrevive).
 create unique index if not exists idx_tasks_cobranca_prazo_uniq on public.tasks (cobranca_id, prazo) where cobranca_id is not null;
 
+-- ================================================================
+-- Follow-up automático do Comercial: quando o follow-up ou a data de
+-- avaliação de um lead vence ou fica atrasado, o Pulso gera sozinho uma
+-- tarefa pro responsável comercial do lead — mesmo mecanismo das Cobranças
+-- (verificação ao abrir o app, sem pg_cron; ver o useEffect ao lado de
+-- handleGenerateFollowUpTask no App.jsx).
+-- ================================================================
+alter table public.tasks add column if not exists lead_id uuid references public.leads(id) on delete set null;
+
+-- Trava contra tarefa duplicada pro mesmo lead+prazo (mesmo backstop das
+-- Cobranças, pra duas pessoas não gerarem a mesma tarefa ao mesmo tempo).
+create unique index if not exists idx_tasks_lead_prazo_uniq on public.tasks (lead_id, prazo) where lead_id is not null;
+
+-- A tarefa automática precisa poder ir pro responsável comercial do lead,
+-- que pode ser qualquer pessoa do time — não só dono/gerente. A policy
+-- "tasks_insert" original (lá em cima) não deixa uma pessoa "base" criar
+-- tarefa pra outra pessoa "base" (só pra si mesma ou pra gerente), o que
+-- bloquearia a automação sempre que quem estiver com o app aberto não for
+-- nem a própria responsável nem o dono/gerente. Redefinida aqui (cláusulas
+-- antigas + uma nova) porque só agora, depois de "leads" existir no
+-- arquivo, dá pra referenciar a tabela na policy. A cláusula nova só libera
+-- quando o responsavel_id bate exatamente com o responsavel_comercial já
+-- cadastrado *naquele* lead — não abre atribuição livre entre colegas, só
+-- deixa a automação refletir o que já estava definido no cadastro do lead.
+drop policy if exists "tasks_insert" on public.tasks;
+create policy "tasks_insert" on public.tasks for insert to authenticated
+with check (
+  public.my_role() = 'owner'
+  or (
+    public.my_role() = 'gerente'
+    and public.my_clinica() = clinica_id
+    and exists (
+      select 1 from public.profiles r
+      where r.id = responsavel_id
+      and (r.role = 'owner' or r.clinica_id = public.my_clinica())
+    )
+  )
+  or (
+    public.my_role() = 'base'
+    and public.my_clinica() = clinica_id
+    and (
+      responsavel_id = (select auth.uid())
+      or exists (
+        select 1 from public.profiles g
+        where g.id = responsavel_id and g.role = 'gerente' and g.clinica_id = public.my_clinica()
+      )
+    )
+  )
+  or (
+    public.my_clinica() = clinica_id
+    and lead_id is not null
+    and exists (
+      select 1 from public.leads l
+      where l.id = lead_id and l.responsavel_comercial = responsavel_id and l.clinica_id = tasks.clinica_id
+    )
+  )
+);
+
 -- O app não tem nenhuma tela/ação anônima (sempre exige login), então essas
 -- funções auxiliares nunca deveriam ser chamáveis por quem não está
 -- logado — por padrão o Postgres concede EXECUTE pra PUBLIC (que "anon" e
@@ -798,14 +771,12 @@ revoke execute on function public.my_role() from public;
 revoke execute on function public.my_clinica() from public;
 revoke execute on function public.can_access_task(uuid) from public;
 revoke execute on function public.estoque_check_update() from public;
-revoke execute on function public.indicacao_processar() from public;
 revoke execute on function public.reassign_before_profile_delete() from public;
 
 grant execute on function public.my_role() to authenticated;
 grant execute on function public.my_clinica() to authenticated;
 grant execute on function public.can_access_task(uuid) to authenticated;
 grant execute on function public.estoque_check_update() to authenticated;
-grant execute on function public.indicacao_processar() to authenticated;
 grant execute on function public.reassign_before_profile_delete() to authenticated;
 
 -- Realtime: pra uma tarefa criada numa tela aparecer nas outras na hora.
@@ -818,7 +789,7 @@ declare
 begin
   foreach t in array array[
     'tasks','profiles','task_attachments','task_comments',
-    'task_checklist_items','task_activity','leads','estoque_itens','indicacoes',
+    'task_checklist_items','task_activity','leads','estoque_itens',
     'cobrancas'
   ]
   loop
