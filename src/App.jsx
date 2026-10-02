@@ -37,6 +37,9 @@ import {
   MessageCircle,
   CreditCard,
   Undo2,
+  Search,
+  Sun,
+  Moon,
 } from "lucide-react";
 import {
   BarChart,
@@ -65,7 +68,7 @@ const STATUS_ORDER = ["pendente", "em_andamento", "concluida"];
 const PRIORIDADES = {
   alta: { label: "Alta", color: "var(--danger)", bg: "var(--danger-soft)" },
   media: { label: "Média", color: "var(--warning)", bg: "var(--warning-soft)" },
-  baixa: { label: "Baixa", color: "var(--muted)", bg: "#EAEDEA" },
+  baixa: { label: "Baixa", color: "var(--muted)", bg: "var(--surface-muted)" },
 };
 const PRIORIDADE_ORDER = ["alta", "media", "baixa"];
 
@@ -90,12 +93,22 @@ const LEAD_STAGES = [
   { id: "negociacao", label: "Em negociação" },
   { id: "follow_up", label: "Follow-up" },
   { id: "aguardando_pagamento", label: "Aguardando pagamento" },
+  { id: "pagamento_parcial", label: "Pagamento Parcial" },
   { id: "fechado", label: "Fechado" },
   { id: "perdido", label: "Perdido" },
 ];
 // Etapas de indicação só existem no funil da GIO (a Sorridents não trabalha
 // indicação de procedimento nem indicação de cliente por esse funil).
 const INDICACAO_STAGE_IDS = ["indicacao_procedimento", "indicacao_cliente"];
+// "Pagamento Parcial" é só da Sorridents: cliente que comprou parte do
+// tratamento mas não tudo, pra equipe reativar depois e vender o restante.
+const SORRIDENTS_ONLY_STAGE_IDS = ["pagamento_parcial"];
+// Lista de etapas visível no funil de uma clínica: cada uma só vê as etapas
+// específicas da outra (indicação é só GIO, pagamento parcial é só Sorridents).
+function stagesFor(isGioFlag) {
+  const hiddenIds = isGioFlag ? SORRIDENTS_ONLY_STAGE_IDS : INDICACAO_STAGE_IDS;
+  return LEAD_STAGES.filter((s) => !hiddenIds.includes(s.id));
+}
 const ORIGENS_LEAD = [
   { id: "instagram", label: "Instagram" },
   { id: "indicacao", label: "Indicação" },
@@ -109,6 +122,46 @@ function origemLabel(id) {
 function fmtMoney(v) {
   if (v === null || v === undefined || v === "") return null;
   return Number(v).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+// Normaliza texto pra busca: minúsculo e sem acento, assim "car" encontra
+// "Carla", "Carlos" e também "Carolína" (se algum dia tiver acento).
+function normalizeSearch(s) {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+const THEME_STORAGE_KEY = "pulso-theme";
+
+// Modo claro/escuro: lê preferência salva, cai pro tema do sistema quando não
+// há nada salvo ainda, e persiste qualquer troca feita pela pessoa. Cada tela
+// de nível raiz (login, "sem clínica", app principal) chama esse hook por
+// conta própria — são componentes separados, cada um precisa do seu próprio
+// estado — mas todos leem/escrevem a mesma chave, então ficam sincronizados.
+function useThemeMode() {
+  const [theme, setTheme] = useState(() => {
+    try {
+      const saved = localStorage.getItem(THEME_STORAGE_KEY);
+      if (saved === "light" || saved === "dark") return saved;
+    } catch {
+      // localStorage indisponível (modo privado, etc.) — segue com o padrão abaixo.
+    }
+    if (typeof window !== "undefined" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+      return "dark";
+    }
+    return "light";
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // Best-effort: se não der pra salvar, a pessoa só escolhe de novo na próxima visita.
+    }
+  }, [theme]);
+  return [theme, setTheme];
 }
 
 // Monta o link do WhatsApp Web já abrindo a conversa do número (assume Brasil quando faltar o DDI).
@@ -146,6 +199,16 @@ function mapLead(row) {
   };
 }
 
+function mapFollowupLog(row) {
+  return {
+    id: row.id,
+    leadId: row.lead_id,
+    clinicaId: row.clinica_id,
+    resolvidoPor: row.resolvido_por,
+    resolvidoEm: row.resolvido_em,
+  };
+}
+
 function mapCobranca(row) {
   return {
     id: row.id,
@@ -157,6 +220,7 @@ function mapCobranca(row) {
     valorParcela: row.valor_parcela,
     numeroParcelas: row.numero_parcelas,
     parcelasPagas: row.parcelas_pagas,
+    ultimoCicloConfirmado: row.ultimo_ciclo_confirmado,
     observacoes: row.observacoes,
     ativo: row.ativo,
     criadoPor: row.criado_por,
@@ -165,10 +229,11 @@ function mapCobranca(row) {
 }
 
 // ---------- Controle de cobranças (boleto / recorrente) da GIO ----------
-// Quantos dias de "folga" depois do dia certo a tarefa ainda pode ser criada,
-// caso ninguém tenha aberto o app exatamente naquele dia (a checagem roda ao
-// abrir o Pulso, não é um agendamento automático no servidor).
-const COBRANCA_GRACE_DAYS = 6;
+// Não gera mais tarefa nenhuma na aba Tarefas (mesmo motivo da separação do
+// Comercial: misturava os dois fluxos). Todo o controle de uma cobrança —
+// inclusive marcar/desfazer o pagamento do mês — vive só aqui na aba
+// Cobranças, direto no cadastro (`ultimoCicloConfirmado`), sem depender de
+// nenhuma tarefa ser criada, concluída ou desfeita.
 
 function clampDayToMonth(year, monthIndex0, day) {
   const lastDay = new Date(year, monthIndex0 + 1, 0).getDate();
@@ -183,28 +248,6 @@ function dueDateThisCycle(diaVencimento, refDateISO) {
   return `${y}-${String(m).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
-function addDaysISO(dateISO, n) {
-  const [y, m, d] = dateISO.split("-").map(Number);
-  const date = new Date(Date.UTC(y, m - 1, d));
-  date.setUTCDate(date.getUTCDate() + n);
-  return date.toISOString().slice(0, 10);
-}
-
-// Subtrai N dias úteis (só pula sábado/domingo — sem calendário de feriados).
-function subtractBusinessDays(dateISO, n) {
-  const [y, m, d] = dateISO.split("-").map(Number);
-  const date = new Date(Date.UTC(y, m - 1, d));
-  let remaining = n;
-  while (remaining > 0) {
-    date.setUTCDate(date.getUTCDate() - 1);
-    const dow = date.getUTCDay();
-    if (dow !== 0 && dow !== 6) remaining--;
-  }
-  return date.toISOString().slice(0, 10);
-}
-
-// Decide se uma cobrança precisa gerar tarefa hoje, e qual. Retorna null se
-// não for o caso (fora da janela, já pagou todas as parcelas, ou inativa).
 function daysBetweenISO(aISO, bISO) {
   const [ay, am, ad] = aISO.split("-").map(Number);
   const [by, bm, bd] = bISO.split("-").map(Number);
@@ -213,26 +256,9 @@ function daysBetweenISO(aISO, bISO) {
   return Math.round((b - a) / 86400000);
 }
 
-function computeCobrancaTask(cobranca, hojeISO) {
-  if (!cobranca.ativo) return null;
-  if (cobranca.parcelasPagas >= cobranca.numeroParcelas) return null;
-  const vencimento = dueDateThisCycle(cobranca.diaVencimento, hojeISO);
-  const janelaFim = addDaysISO(vencimento, COBRANCA_GRACE_DAYS);
-  let janelaInicio, titulo;
-  if (cobranca.formaPagamento === "boleto") {
-    janelaInicio = subtractBusinessDays(vencimento, 1);
-    titulo = `Enviar 2ª via do boleto — ${cobranca.nomeCliente}`;
-  } else {
-    janelaInicio = vencimento;
-    titulo = `Conferir pagamento recorrente — ${cobranca.nomeCliente}`;
-  }
-  if (hojeISO < janelaInicio || hojeISO > janelaFim) return null;
-  return { titulo, prazo: vencimento };
-}
-
-// Mesma data de vencimento, N meses à frente (clampando em meses mais
-// curtos, igual dueDateThisCycle). Usada só pra mostrar "próximo
-// vencimento" quando o ciclo atual já foi pago.
+// Mesma data de vencimento, N meses à frente/atrás (clampando em meses mais
+// curtos, igual dueDateThisCycle). Usada pra achar o ciclo seguinte/anterior
+// a partir de uma data de vencimento já confirmada.
 function dueDateMonthsAhead(diaVencimento, refDateISO, monthsToAdd) {
   const [y, m] = refDateISO.split("-").map(Number);
   const total = (m - 1) + monthsToAdd;
@@ -242,38 +268,54 @@ function dueDateMonthsAhead(diaVencimento, refDateISO, monthsToAdd) {
   return `${ny}-${String(nm0 + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
 }
 
-// Acha a tarefa de cobrança mais recente (qualquer status) pra essa cobrança
-// — usada pra saber se o ciclo atual já foi marcado como pago.
-function tarefaAtualDaCobranca(tasks, cobrancaId) {
-  const doCliente = (tasks || []).filter((t) => t.cobrancaId === cobrancaId).sort((a, b) => (b.prazo || "").localeCompare(a.prazo || ""));
-  return doCliente[0] || null;
+// Qual é o ciclo (data de vencimento) ainda não confirmado como pago. Se
+// nunca confirmou nenhum, o ciclo em aberto é o deste mês-calendário; se já
+// confirmou algum, é sempre o mês seguinte ao último confirmado — mesmo que
+// isso já tenha ficado pra trás (cliente que deve 2+ meses segue mostrando o
+// mais antigo ainda não confirmado).
+function cicloEmAbertoCobranca(cobranca, hojeISO) {
+  if (!cobranca.ultimoCicloConfirmado) return dueDateThisCycle(cobranca.diaVencimento, hojeISO);
+  return dueDateMonthsAhead(cobranca.diaVencimento, cobranca.ultimoCicloConfirmado, 1);
 }
 
 // Resume o próximo vencimento de uma cobrança em texto claro (em vez de só
 // "dia XX", que exige conta de cabeça) — pra exibição e pra ordenar a lista
-// por urgência. Não muda nada no fluxo de marcar como paga: se o ciclo atual
-// já foi concluído, mostra o vencimento do mês seguinte em vez do que já
-// passou. Retorna { status, label, dias }, com status em:
-// "atrasada" | "hoje" | "amanha" | "futura" | "paga" | "quitada" | "inativa".
-function proximoVencimentoInfo(cobranca, tarefaAtual, hojeISO) {
-  if (!cobranca.ativo) return { status: "inativa", label: "Inativa", dias: null };
+// por urgência. Pedido do Wagner: não acender "em atraso" assim que vence —
+// dá uma tolerância de um ciclo inteiro (só fica "atrasada" quando chega o
+// vencimento do mês SEGUINTE ao ciclo ainda não confirmado). Retorna
+// { status, label, dias, cicloAberto }, com status em:
+// "atrasada" | "tolerancia" | "hoje" | "amanha" | "futura" | "paga" | "quitada" | "inativa".
+function proximoVencimentoInfo(cobranca, hojeISO) {
+  // Quitada primeiro: quando a última parcela é alcançada, o Pulso desativa
+  // a cobrança sozinho (ativo vira false) — se checasse "inativa" antes, uma
+  // cobrança terminada normalmente apareceria como "Inativa" (parece
+  // cancelada) em vez de "Todas as parcelas pagas".
   if (cobranca.parcelasPagas >= cobranca.numeroParcelas) {
-    return { status: "quitada", label: "Todas as parcelas pagas", dias: null };
+    return { status: "quitada", label: "Todas as parcelas pagas", dias: null, cicloAberto: null };
   }
-  const cicloAtual = dueDateThisCycle(cobranca.diaVencimento, hojeISO);
-  const cicloPago = !!tarefaAtual && tarefaAtual.prazo === cicloAtual && tarefaAtual.status === "concluida";
-  const vencimento = cicloPago ? dueDateMonthsAhead(cobranca.diaVencimento, hojeISO, 1) : cicloAtual;
-  const dias = daysBetweenISO(hojeISO, vencimento);
-  if (cicloPago) {
-    return { status: "paga", label: `Pago este mês · próximo vencimento ${fmtDate(vencimento)}`, dias };
+  if (!cobranca.ativo) return { status: "inativa", label: "Inativa", dias: null, cicloAberto: null };
+  const cicloCalendario = dueDateThisCycle(cobranca.diaVencimento, hojeISO);
+  if (cobranca.ultimoCicloConfirmado && cobranca.ultimoCicloConfirmado >= cicloCalendario) {
+    const proximo = dueDateMonthsAhead(cobranca.diaVencimento, hojeISO, 1);
+    return { status: "paga", label: `Pago este mês · próximo vencimento ${fmtDate(proximo)}`, dias: daysBetweenISO(hojeISO, proximo), cicloAberto: null };
   }
-  if (dias < 0) {
-    const n = Math.abs(dias);
-    return { status: "atrasada", label: `Venceu há ${n} dia${n === 1 ? "" : "s"} (${fmtDate(vencimento)})`, dias };
+  const cicloAberto = cicloEmAbertoCobranca(cobranca, hojeISO);
+  const cicloSeguinte = dueDateMonthsAhead(cobranca.diaVencimento, cicloAberto, 1);
+  const dias = daysBetweenISO(hojeISO, cicloAberto);
+  if (hojeISO >= cicloSeguinte) {
+    const n = daysBetweenISO(cicloAberto, hojeISO);
+    return { status: "atrasada", label: `Venceu há ${n} dia${n === 1 ? "" : "s"} (${fmtDate(cicloAberto)})`, dias, cicloAberto };
   }
-  if (dias === 0) return { status: "hoje", label: "Vence hoje", dias };
-  if (dias === 1) return { status: "amanha", label: `Vence amanhã (${fmtDate(vencimento)})`, dias };
-  return { status: "futura", label: `Vence em ${dias} dias (${fmtDate(vencimento)})`, dias };
+  if (dias === 0) return { status: "hoje", label: "Vence hoje", dias, cicloAberto };
+  if (dias === 1) return { status: "amanha", label: `Vence amanhã (${fmtDate(cicloAberto)})`, dias, cicloAberto };
+  if (dias > 1) return { status: "futura", label: `Vence em ${dias} dias (${fmtDate(cicloAberto)})`, dias, cicloAberto };
+  const n = Math.abs(dias);
+  return {
+    status: "tolerancia",
+    label: `Venceu há ${n} dia${n === 1 ? "" : "s"} · aguardando confirmação`,
+    dias,
+    cicloAberto,
+  };
 }
 
 // Data relevante de contato do lead: na etapa "avaliação agendada" é a data
@@ -299,6 +341,24 @@ function isFollowUpHoje(lead) {
   if (!data) return false;
   if (lead.etapa === "fechado" || lead.etapa === "perdido") return false;
   return data === todayISO();
+}
+
+// Se o lead estava com follow-up/avaliação atrasado ou vencendo hoje, e essa
+// atualização mexeu na etapa ou na data relevante, registra a resolução em
+// lead_followup_log — alimenta "Follow-ups concluídos por pessoa" no Painel.
+// Editar outros campos (nome, valor, etc.) sem tocar nisso não conta, e um
+// lead recém-criado nunca passa por aqui (não existe "leadAntes" pra ele).
+async function registrarFollowUpResolvido(leadAntes, depois, profileId) {
+  if (!leadAntes) return;
+  const estavaPendente = isFollowUpAtrasado(leadAntes) || isFollowUpHoje(leadAntes);
+  if (!estavaPendente) return;
+  const resolveu = depois.etapa !== leadAntes.etapa || leadContatoRelevante(depois) !== leadContatoRelevante(leadAntes);
+  if (!resolveu) return;
+  await supabase.from("lead_followup_log").insert({
+    lead_id: leadAntes.id,
+    clinica_id: leadAntes.clinicaId,
+    resolvido_por: profileId,
+  });
 }
 
 function clinicaInfo(id) {
@@ -390,6 +450,17 @@ function lastNDays(n) {
     days.push(d.toISOString().slice(0, 10));
   }
   return days;
+}
+
+// Conta quantos follow-ups do Comercial a pessoa resolveu dentro da janela de
+// `days` dias terminando hoje (hoje inclusive). Usa lead_followup_log, que só
+// recebe uma entrada quando um follow-up pendente é resolvido — nunca quando
+// um lead novo é criado (ver registrarFollowUpResolvido).
+function countFollowUpsWindow(log, memberId, days) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - (days - 1));
+  const cutoffISO = cutoff.toISOString().slice(0, 10);
+  return log.filter((f) => f.resolvidoPor === memberId && f.resolvidoEm && f.resolvidoEm.slice(0, 10) >= cutoffISO).length;
 }
 
 function memberName(id, team) {
@@ -696,11 +767,40 @@ const GlobalStyle = () => (
       --danger: #C24949;
       --danger-soft: #F7E3E3;
       --line: #E1E5E1;
+      --surface-muted: #EAEDEA;
+      --column-bg: #F8FAF9;
+      --chart-track: #D8DFDC;
+      --shadow-card: 0 1px 2px rgba(22,35,31,0.04), 0 8px 20px -14px rgba(22,35,31,0.18);
+      --shadow-card-hover: 0 2px 4px rgba(22,35,31,0.06), 0 14px 28px -14px rgba(22,35,31,0.26);
       font-family: 'IBM Plex Sans', sans-serif;
       color: var(--ink);
       background: var(--bg);
       min-height: 100%;
       width: 100%;
+      transition: background .2s ease, color .2s ease;
+    }
+    .gec-root[data-theme="dark"] {
+      --bg: #101A16;
+      --surface: #17241F;
+      --ink: #EAF2EE;
+      --muted: #8CA39A;
+      --primary: #3DAF8D;
+      --primary-dark: #2E8E71;
+      --primary-soft: rgba(61,175,141,0.16);
+      --accent: #E0A354;
+      --accent-soft: rgba(224,163,84,0.16);
+      --success: #4ECE9A;
+      --success-soft: rgba(78,206,154,0.16);
+      --warning: #E3A345;
+      --warning-soft: rgba(227,163,69,0.16);
+      --danger: #E5807D;
+      --danger-soft: rgba(229,128,125,0.18);
+      --line: #28362F;
+      --surface-muted: #1E2B25;
+      --column-bg: #142019;
+      --chart-track: #2A3A33;
+      --shadow-card: 0 1px 2px rgba(0,0,0,0.2), 0 8px 20px -14px rgba(0,0,0,0.5);
+      --shadow-card-hover: 0 2px 4px rgba(0,0,0,0.25), 0 14px 28px -14px rgba(0,0,0,0.6);
     }
     .gec-root * { box-sizing: border-box; }
     .gec-display { font-family: 'Fraunces', serif; }
@@ -735,7 +835,7 @@ const GlobalStyle = () => (
     .gec-btn-primary:hover { background: var(--primary-dark); }
     .gec-btn-primary:disabled { opacity: .6; cursor: default; }
     .gec-btn-ghost { background: transparent; color: var(--ink); border-color: var(--line); }
-    .gec-btn-ghost:hover { background: #EAEDEA; }
+    .gec-btn-ghost:hover { background: var(--surface-muted); }
     .gec-btn-danger { background: transparent; color: var(--danger); border-color: var(--danger-soft); }
     .gec-btn-danger:hover { background: var(--danger-soft); }
 
@@ -789,9 +889,29 @@ const GlobalStyle = () => (
 
     .gec-pulse-cell {
       width: 14px; height: 14px; border-radius: 4px;
-      background: #EAEDEA; border: 1px solid var(--line);
+      background: var(--surface-muted); border: 1px solid var(--line);
       flex-shrink: 0;
     }
+
+    .gec-clickable-card {
+      box-shadow: var(--shadow-card);
+      transition: transform .15s ease, box-shadow .15s ease, background .2s ease, border-color .2s ease;
+    }
+    .gec-clickable-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-card-hover); }
+
+    .gec-progress-track {
+      width: 100%; height: 5px; border-radius: 999px;
+      background: var(--surface-muted); overflow: hidden;
+    }
+    .gec-progress-fill {
+      height: 100%; border-radius: 999px; background: var(--primary);
+      transition: width .3s ease;
+    }
+
+    .gec-theme-toggle {
+      position: relative; overflow: hidden;
+    }
+    .gec-theme-toggle svg { transition: transform .3s ease, opacity .3s ease; }
 
     .gec-scrollbar::-webkit-scrollbar { height: 6px; width: 6px; }
     .gec-scrollbar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
@@ -838,7 +958,7 @@ const GlobalStyle = () => (
       align-items: start;
     }
     .gec-column {
-      background: #F8FAF9;
+      background: var(--column-bg);
       border: 1px solid var(--line);
       border-radius: 14px;
       padding: 12px;
@@ -851,6 +971,8 @@ const GlobalStyle = () => (
       display: flex;
       flex-direction: column;
       gap: 8px;
+      box-shadow: var(--shadow-card);
+      transition: background .2s ease, border-color .2s ease;
     }
 
     @media print {
@@ -897,6 +1019,25 @@ function Avatar({ nome, size = 32 }) {
   );
 }
 
+// Botão de alternar claro/escuro — reaproveitado nas 3 telas de nível raiz
+// (login, "sem clínica" e app principal), cada uma com seu próprio estado
+// vindo de useThemeMode(), mas lendo/gravando a mesma preferência salva.
+function ThemeToggleButton({ theme, setTheme }) {
+  const isDark = theme === "dark";
+  return (
+    <button
+      type="button"
+      className="gec-btn gec-btn-ghost gec-theme-toggle"
+      style={{ padding: 8 }}
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+      aria-label={isDark ? "Mudar para tema claro" : "Mudar para tema escuro"}
+      title={isDark ? "Tema claro" : "Tema escuro"}
+    >
+      {isDark ? <Sun size={14} /> : <Moon size={14} />}
+    </button>
+  );
+}
+
 function StatusPill({ status, atrasada }) {
   if (atrasada) {
     return (
@@ -910,7 +1051,7 @@ function StatusPill({ status, atrasada }) {
   // problema de verdade).
   const s = STATUS[status] || { label: status || "—", color: "var(--muted)" };
   const bgMap = {
-    pendente: "#EAEDEA",
+    pendente: "var(--surface-muted)",
     em_andamento: "var(--warning-soft)",
     concluida: "var(--success-soft)",
   };
@@ -935,7 +1076,7 @@ function PriorityPill({ prioridade }) {
 function CategoryTag({ categoria }) {
   if (!categoria) return null;
   return (
-    <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>
+    <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>
       <Tag size={11} /> {categoriaLabel(categoria)}
     </span>
   );
@@ -1036,6 +1177,7 @@ function EmptyState({ icon: Icon, title, subtitle }) {
 
 // ---------- Login (nome -> senha, autenticado de verdade via Supabase Auth) ----------
 function LoginScreen() {
+  const [theme, setTheme] = useThemeMode();
   const [login, setLogin] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -1055,8 +1197,11 @@ function LoginScreen() {
   }
 
   return (
-    <div className="gec-root" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+    <div className="gec-root" data-theme={theme} style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, position: "relative" }}>
       <GlobalStyle />
+      <div style={{ position: "absolute", top: 16, right: 16 }}>
+        <ThemeToggleButton theme={theme} setTheme={setTheme} />
+      </div>
       <div className="gec-login-card gec-fade-in" style={{ width: "100%", maxWidth: 380, padding: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 26 }}>
           <div style={{ width: 38, height: 38, borderRadius: 10, background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -1107,9 +1252,13 @@ function LoginScreen() {
 // ---------- Perfil sem clínica vinculada: bloqueia o app com um aviso claro,
 // em vez de deixar a pessoa navegar por telas vazias sem entender o motivo.
 function NoClinicaScreen({ onLogout }) {
+  const [theme, setTheme] = useThemeMode();
   return (
-    <div className="gec-root" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+    <div className="gec-root" data-theme={theme} style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, position: "relative" }}>
       <GlobalStyle />
+      <div style={{ position: "absolute", top: 16, right: 16 }}>
+        <ThemeToggleButton theme={theme} setTheme={setTheme} />
+      </div>
       <div className="gec-login-card gec-fade-in" style={{ width: "100%", maxWidth: 380, padding: 32, textAlign: "center" }}>
         <AlertTriangle size={26} color="var(--danger)" style={{ marginBottom: 12 }} />
         <div className="gec-display" style={{ fontSize: 17, fontWeight: 600, marginBottom: 8 }}>Sua conta ainda não está vinculada a uma clínica</div>
@@ -1124,39 +1273,29 @@ function NoClinicaScreen({ onLogout }) {
   );
 }
 
-// ---------- Pulse strip ----------
-function PulseStrip({ tasks, memberId, days = 14 }) {
-  const dayList = lastNDays(days);
-  const counts = useMemo(() => {
-    const map = {};
-    dayList.forEach((d) => (map[d] = 0));
-    tasks
-      .filter((t) => t.responsavelId === memberId && t.status === "concluida" && t.concluidoEm)
-      .forEach((t) => {
-        const d = t.concluidoEm.slice(0, 10);
-        if (d in map) map[d] += 1;
-      });
-    return map;
-  }, [tasks, memberId, dayList]);
-
-  function cellStyle(n) {
-    if (n === 0) return { background: "#EAEDEA", border: "1px solid var(--line)" };
-    if (n === 1) return { background: "var(--primary-soft)", border: "1px solid var(--primary-soft)" };
-    if (n === 2) return { background: "#8FC4B6", border: "1px solid #8FC4B6" };
-    return { background: "var(--primary)", border: "1px solid var(--primary)" };
-  }
-
+function FollowUpBadge({ label, value }) {
   return (
-    <div className="gec-scrollbar" style={{ display: "flex", gap: 4, overflowX: "auto", padding: "2px 0" }}>
-      {dayList.map((d) => (
-        <div key={d} className="gec-pulse-cell" style={cellStyle(counts[d])} title={`${d}: ${counts[d]} concluída(s)`} />
-      ))}
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        minWidth: 58,
+        padding: "6px 10px",
+        borderRadius: 10,
+        background: "var(--primary-soft)",
+      }}
+    >
+      <div className="gec-display" style={{ fontSize: 16, fontWeight: 700, color: "var(--primary-dark)" }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--primary-dark)", fontWeight: 600, textTransform: "uppercase", letterSpacing: ".02em" }}>{label}</div>
     </div>
   );
 }
 
 // ---------- Dashboard ----------
-function Dashboard({ team, tasks, onOpenTask }) {
+function Dashboard({ team, tasks, leads = [], followupLog = [], cobrancas = [], showCobrancas = false, onOpenTask, onOpenLead, onOpenCobrancas }) {
   const stats = useMemo(() => {
     const total = tasks.length;
     const concluidas = tasks.filter((t) => t.status === "concluida").length;
@@ -1164,6 +1303,73 @@ function Dashboard({ team, tasks, onOpenTask }) {
     const emAndamento = tasks.filter((t) => t.status === "em_andamento").length;
     return { total, concluidas, atrasadas, emAndamento };
   }, [tasks]);
+
+  // Central do Comercial: oportunidades em aberto (ainda não fechadas nem
+  // perdidas), atrasadas/vencendo hoje (follow-up ou avaliação, conforme a
+  // etapa — ver leadContatoRelevante) e sem responsável definido. Isso some
+  // de vez da aba Tarefas — a equipe resolve esses atrasos direto na aba
+  // Comercial; aqui é só visão gerencial dos dois lados (tarefas + leads).
+  const comercialStats = useMemo(() => {
+    const abertas = leads.filter((l) => l.etapa !== "fechado" && l.etapa !== "perdido");
+    const atrasadas = abertas.filter((l) => isFollowUpAtrasado(l)).length;
+    const hoje = abertas.filter((l) => !isFollowUpAtrasado(l) && isFollowUpHoje(l)).length;
+    const semResponsavel = abertas.filter((l) => !l.responsavelComercial).length;
+    return { abertas: abertas.length, atrasadas, hoje, semResponsavel };
+  }, [leads]);
+
+  const leadExtraItems = useMemo(
+    () =>
+      leads
+        .filter((l) => l.etapa !== "fechado" && l.etapa !== "perdido")
+        .filter((l) => isFollowUpAtrasado(l) || isFollowUpHoje(l))
+        .map((l) => ({
+          id: `l-${l.id}`,
+          titulo: `${l.nomePaciente} · ${l.etapa === "avaliacao_agendada" ? "confirmar avaliação" : "follow-up"}`,
+          prazo: leadContatoRelevante(l),
+          tipo: isFollowUpAtrasado(l) ? "atrasada" : "followup",
+          subtitulo: l.responsavelComercial ? memberName(l.responsavelComercial, team) : "Sem responsável",
+          onOpen: () => onOpenLead && onOpenLead(l),
+        })),
+    [leads, team, onOpenLead]
+  );
+
+  // Central de Cobranças (GIO): mesma lógica de "em atraso" mostrada nos
+  // cards da aba Cobranças (ver proximoVencimentoInfo) — só entra na central
+  // quem já passou da tolerância de verdade, não quem só venceu esse mês e
+  // ainda está dentro do prazo de confirmação.
+  const hojeISOCobrancas = todayISO();
+  const cobrancaInfos = useMemo(
+    () => cobrancas.filter((c) => c.ativo).map((c) => ({ cobranca: c, info: proximoVencimentoInfo(c, hojeISOCobrancas) })),
+    [cobrancas, hojeISOCobrancas]
+  );
+  const cobrancaStats = useMemo(() => {
+    const ativas = cobrancas.filter((c) => c.ativo).length;
+    const atrasadas = cobrancaInfos.filter(({ info }) => info.status === "atrasada").length;
+    const hoje = cobrancaInfos.filter(({ info }) => info.status === "hoje").length;
+    // Exclui "paga" (o `dias` dela é até o PRÓXIMO ciclo, não o em aberto) —
+    // senão uma cobrança já confirmada este mês podia contar aqui só porque
+    // o vencimento do mês que vem calhou de cair dentro de 7 dias, o que
+    // deixaria esse número maior aqui do que na aba Cobranças.
+    const vencendoEmBreve = cobrancaInfos.filter(({ info }) => info.dias !== null && info.dias >= 0 && info.dias <= 7 && info.status !== "paga").length;
+    return { ativas, atrasadas, hoje, vencendoEmBreve };
+  }, [cobrancas, cobrancaInfos]);
+
+  const cobrancaExtraItems = useMemo(
+    () =>
+      cobrancaInfos
+        .filter(({ info }) => info.status === "atrasada" || info.status === "hoje")
+        .map(({ cobranca: c, info }) => ({
+          id: `c-${c.id}`,
+          titulo: `${c.nomeCliente} · cobrança`,
+          prazo: info.cicloAberto,
+          tipo: info.status,
+          subtitulo: COBRANCA_LABEL(c.formaPagamento),
+          onOpen: () => onOpenCobrancas && onOpenCobrancas(),
+        })),
+    [cobrancaInfos, onOpenCobrancas]
+  );
+
+  const todosExtraItems = useMemo(() => [...leadExtraItems, ...cobrancaExtraItems], [leadExtraItems, cobrancaExtraItems]);
 
   const chartData = useMemo(
     () =>
@@ -1180,7 +1386,8 @@ function Dashboard({ team, tasks, onOpenTask }) {
 
   return (
     <div className="gec-fade-in">
-      <OverdueBanner tasks={tasks} team={team} onOpenTask={onOpenTask} />
+      <OverdueBanner tasks={tasks} team={team} onOpenTask={onOpenTask} includeToday extraItems={todosExtraItems} />
+      <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 700, textTransform: "uppercase", letterSpacing: ".03em", marginBottom: 8 }}>Tarefas</div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22 }}>
         <div className="gec-card" style={{ padding: 16 }}>
           <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600, marginBottom: 6 }}>TOTAL DE TAREFAS</div>
@@ -1200,6 +1407,53 @@ function Dashboard({ team, tasks, onOpenTask }) {
         </div>
       </div>
 
+      <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 700, textTransform: "uppercase", letterSpacing: ".03em", marginBottom: 8 }}>Comercial</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22 }}>
+        <div className="gec-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600, marginBottom: 6 }}>OPORTUNIDADES ABERTAS</div>
+          <div className="gec-display" style={{ fontSize: 28, fontWeight: 600 }}>{comercialStats.abertas}</div>
+        </div>
+        <div className="gec-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 12, color: "var(--danger)", fontWeight: 600, marginBottom: 6 }}>EM ATRASO</div>
+          <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--danger)" }}>{comercialStats.atrasadas}</div>
+        </div>
+        <div className="gec-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 12, color: "var(--warning)", fontWeight: 600, marginBottom: 6 }}>VENCEM HOJE</div>
+          <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--warning)" }}>{comercialStats.hoje}</div>
+        </div>
+        <div className="gec-card" style={{ padding: 16 }}>
+          <div style={{ fontSize: 12, color: "var(--accent)", fontWeight: 600, marginBottom: 6 }}>SEM RESPONSÁVEL</div>
+          <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--accent)" }}>{comercialStats.semResponsavel}</div>
+        </div>
+      </div>
+
+      {showCobrancas && (
+        <>
+          <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 700, textTransform: "uppercase", letterSpacing: ".03em", marginBottom: 8 }}>Cobranças</div>
+          <div
+            style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 12, marginBottom: 22, cursor: onOpenCobrancas ? "pointer" : "default" }}
+            onClick={() => onOpenCobrancas && onOpenCobrancas()}
+          >
+            <div className="gec-card" style={{ padding: 16 }}>
+              <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600, marginBottom: 6 }}>COBRANÇAS ATIVAS</div>
+              <div className="gec-display" style={{ fontSize: 28, fontWeight: 600 }}>{cobrancaStats.ativas}</div>
+            </div>
+            <div className="gec-card" style={{ padding: 16 }}>
+              <div style={{ fontSize: 12, color: "var(--danger)", fontWeight: 600, marginBottom: 6 }}>EM ATRASO</div>
+              <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--danger)" }}>{cobrancaStats.atrasadas}</div>
+            </div>
+            <div className="gec-card" style={{ padding: 16 }}>
+              <div style={{ fontSize: 12, color: "var(--warning)", fontWeight: 600, marginBottom: 6 }}>VENCEM HOJE</div>
+              <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--warning)" }}>{cobrancaStats.hoje}</div>
+            </div>
+            <div className="gec-card" style={{ padding: 16 }}>
+              <div style={{ fontSize: 12, color: "var(--accent)", fontWeight: 600, marginBottom: 6 }}>VENCEM EM 7 DIAS</div>
+              <div className="gec-display" style={{ fontSize: 28, fontWeight: 600, color: "var(--accent)" }}>{cobrancaStats.vencendoEmBreve}</div>
+            </div>
+          </div>
+        </>
+      )}
+
       {team.length > 0 && (
         <div className="gec-card" style={{ padding: 20, marginBottom: 22 }}>
           <div className="gec-display" style={{ fontSize: 15, fontWeight: 600, marginBottom: 14 }}>Produtividade por pessoa</div>
@@ -1211,7 +1465,7 @@ function Dashboard({ team, tasks, onOpenTask }) {
                 <YAxis allowDecimals={false} tick={{ fontSize: 12, fill: "var(--muted)" }} axisLine={false} tickLine={false} />
                 <Tooltip contentStyle={{ borderRadius: 10, border: "1px solid var(--line)", fontSize: 12.5 }} />
                 <Bar dataKey="Concluídas" stackId="a" fill="var(--primary)" radius={[0, 0, 0, 0]} />
-                <Bar dataKey="Pendentes" stackId="a" fill="#D8DFDC" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="Pendentes" stackId="a" fill="var(--chart-track)" radius={[4, 4, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -1219,8 +1473,10 @@ function Dashboard({ team, tasks, onOpenTask }) {
       )}
 
       <div className="gec-card" style={{ padding: 20 }}>
-        <div className="gec-display" style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Pulso de atividade</div>
-        <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 16 }}>Tarefas concluídas nos últimos 14 dias, por pessoa</div>
+        <div className="gec-display" style={{ fontSize: 15, fontWeight: 600, marginBottom: 4 }}>Follow-ups concluídos por pessoa</div>
+        <div style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 16 }}>
+          Follow-ups do Comercial resolvidos (cards atualizados — não conta lead novo criado)
+        </div>
         {team.length === 0 && <EmptyState icon={Users} title="Cadastre sua equipe" subtitle="Peça pro gestor adicionar as funcionárias." />}
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {team.map((m) => (
@@ -1229,7 +1485,12 @@ function Dashboard({ team, tasks, onOpenTask }) {
                 <Avatar nome={m.nome} size={26} />
                 <div style={{ fontSize: 13, fontWeight: 600 }}>{m.nome}</div>
               </div>
-              <PulseStrip tasks={tasks} memberId={m.id} />
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <FollowUpBadge label="Hoje" value={countFollowUpsWindow(followupLog, m.id, 1)} />
+                <FollowUpBadge label="3 dias" value={countFollowUpsWindow(followupLog, m.id, 3)} />
+                <FollowUpBadge label="7 dias" value={countFollowUpsWindow(followupLog, m.id, 7)} />
+                <FollowUpBadge label="14 dias" value={countFollowUpsWindow(followupLog, m.id, 14)} />
+              </div>
             </div>
           ))}
         </div>
@@ -1371,7 +1632,7 @@ function RecurrenceFields({ prazo, value, onChange }) {
         <span className="gec-label" style={{ margin: 0 }}>Repetir esta tarefa</span>
       </label>
       {enabled && (
-        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10, background: "#F8FAF9", border: "1px solid var(--line)", borderRadius: 10, padding: 12 }}>
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10, background: "var(--column-bg)", border: "1px solid var(--line)", borderRadius: 10, padding: 12 }}>
           <select className="gec-select" value={value.type} onChange={(e) => update({ type: e.target.value })}>
             <option value="dias">A cada N dia(s)</option>
             <option value="semanas">A cada N semana(s), em dias específicos</option>
@@ -1836,11 +2097,16 @@ function TaskCard({ task, team, showResponsavel, canDelete, attachmentsCount, co
     : venceHoje
     ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
     : undefined;
+  const responsavelMember = team.find((m) => m.id === task.responsavelId);
   return (
     <div className="gec-task-card" style={cardStyle}>
       <div style={{ fontWeight: 600, fontSize: 13.5 }}>{task.titulo}</div>
-      <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {showResponsavel && <span>{memberName(task.responsavelId, team)}</span>}
+      <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        {showResponsavel && (
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <Avatar nome={responsavelMember?.nome} size={17} /> {responsavelMember?.nome || "—"}
+          </span>
+        )}
         {showResponsavel && <span>·</span>}
         <span>{clinicaInfo(task.clinicaId).curto}</span>
         <span>·</span>
@@ -1917,7 +2183,7 @@ function TaskBoard({ team, tasks, attachmentsByTask, commentsByTask, checklistBy
               <div style={{ fontSize: 12.5, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".03em" }}>
                 {STATUS[statusKey].label}
               </div>
-              <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>{colTasks.length}</span>
+              <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>{colTasks.length}</span>
             </div>
             {colTasks.length === 0 ? (
               <div style={{ fontSize: 12, color: "var(--muted)", padding: "16px 4px", textAlign: "center" }}>Nada aqui</div>
@@ -2032,36 +2298,10 @@ function TasksView({
 }
 
 // ---------- Minhas tarefas (papel base: recepção/comercial) ----------
-function MyTasksView({ user, tasks, leads, assignableOptions, lockedClinicaId, attachmentsByTask, commentsByTask, checklistByTask, onUpdateStatus, onCreate, onOpenDetail, onOpenLead }) {
+function MyTasksView({ user, tasks, assignableOptions, lockedClinicaId, attachmentsByTask, commentsByTask, checklistByTask, onUpdateStatus, onCreate, onOpenDetail }) {
   const [showModal, setShowModal] = useState(false);
   const [concludeTarget, setConcludeTarget] = useState(null);
   const mine = tasks.filter((t) => t.responsavelId === user.id);
-  // Follow-up/avaliação atrasados ou vencendo hoje já viram tarefa de
-  // verdade sozinhos (ver o useEffect ao lado de handleGenerateFollowUpTask,
-  // em PulsoApp) — esse aviso aqui é só uma rede de segurança pro instante
-  // antes dela existir, então exclui os leads que já têm a tarefa real
-  // correspondente, pra não duplicar o aviso.
-  const temTarefaReal = (l) => tasks.some((t) => t.leadId === l.id && t.prazo === leadContatoRelevante(l));
-  const meusFollowUpsHoje = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpHoje(l) && !temTarefaReal(l));
-  const meusFollowUpsAtrasados = (leads || []).filter((l) => l.responsavelComercial === user.id && isFollowUpAtrasado(l) && !temTarefaReal(l));
-  const leadItems = [
-    ...meusFollowUpsAtrasados.map((l) => ({
-      id: `l-${l.id}`,
-      titulo: `${l.nomePaciente} · ${l.etapa === "avaliacao_agendada" ? "confirmar avaliação" : "follow-up"}`,
-      prazo: leadContatoRelevante(l),
-      tipo: "atrasada",
-      subtitulo: null,
-      onOpen: () => onOpenLead && onOpenLead(l),
-    })),
-    ...meusFollowUpsHoje.map((l) => ({
-      id: `l-${l.id}`,
-      titulo: `${l.nomePaciente} · ${l.etapa === "avaliacao_agendada" ? "confirmar avaliação" : "follow-up"}`,
-      prazo: leadContatoRelevante(l),
-      tipo: "followup",
-      subtitulo: null,
-      onOpen: () => onOpenLead && onOpenLead(l),
-    })),
-  ];
 
   function handleMoveStatus(task, status) {
     onUpdateStatus(task.id, status);
@@ -2073,7 +2313,7 @@ function MyTasksView({ user, tasks, leads, assignableOptions, lockedClinicaId, a
   return (
     <>
       <div className="gec-fade-in">
-        <OverdueBanner tasks={mine} team={[]} onOpenTask={onOpenDetail} includeToday showResponsavel={false} extraItems={leadItems} />
+        <OverdueBanner tasks={mine} team={[]} onOpenTask={onOpenDetail} includeToday showResponsavel={false} />
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16 }}>
           <button className="gec-btn gec-btn-primary" onClick={() => setShowModal(true)}>
             <Plus size={15} /> Nova tarefa
@@ -2153,6 +2393,7 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
     : hoje
     ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
     : undefined;
+  const responsavelMember = team.find((m) => m.id === lead.responsavelComercial);
   return (
     <div className="gec-task-card" style={cardStyle}>
       <div style={{ fontWeight: 600, fontSize: 13.5 }}>{lead.nomePaciente}</div>
@@ -2175,7 +2416,16 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
             )}
           </span>
         )}
-        <span>{memberName(lead.responsavelComercial, team)}</span>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {responsavelMember ? (
+            <Avatar nome={responsavelMember.nome} size={17} />
+          ) : (
+            <span style={{ width: 17, height: 17, borderRadius: "50%", border: "1.5px dashed var(--line)", flexShrink: 0 }} />
+          )}
+          <span style={responsavelMember ? undefined : { color: "var(--accent)", fontWeight: 600 }}>
+            {responsavelMember ? responsavelMember.nome : "Sem responsável"}
+          </span>
+        </span>
         {!isGio && lead.codigoPaciente && <span>Código: {lead.codigoPaciente}</span>}
         {lead.procedimento && <span>{lead.procedimento}</span>}
       </div>
@@ -2227,7 +2477,7 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
           </span>
         )}
         {isGio && lead.origem && (
-          <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>
+          <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>
             <Tag size={11} /> {origemLabel(lead.origem)}
           </span>
         )}
@@ -2238,7 +2488,7 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
         value={lead.etapa}
         onChange={(e) => onChangeStage(lead.id, e.target.value)}
       >
-        {LEAD_STAGES.filter((s) => isGio || !INDICACAO_STAGE_IDS.includes(s.id)).map((s) => (
+        {stagesFor(isGio).map((s) => (
           <option key={s.id} value={s.id}>{s.label}</option>
         ))}
       </select>
@@ -2257,8 +2507,12 @@ function LeadCard({ lead, team, canDelete, onOpenDetail, onChangeStage, onDelete
 }
 
 // ---------- Kanban comercial: board horizontal com as 8 etapas ----------
-function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete, hideIndicacaoStages = false }) {
-  const stages = hideIndicacaoStages ? LEAD_STAGES.filter((s) => !INDICACAO_STAGE_IDS.includes(s.id)) : LEAD_STAGES;
+function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDelete, hideIndicacaoStages = false, hidePagamentoParcial = false }) {
+  const stages = LEAD_STAGES.filter((s) => {
+    if (hideIndicacaoStages && INDICACAO_STAGE_IDS.includes(s.id)) return false;
+    if (hidePagamentoParcial && SORRIDENTS_ONLY_STAGE_IDS.includes(s.id)) return false;
+    return true;
+  });
   return (
     <div className="gec-scrollbar" style={{ display: "flex", gap: 14, overflowX: "auto", paddingBottom: 8, alignItems: "flex-start" }}>
       {stages.map((stage) => {
@@ -2283,7 +2537,7 @@ function LeadBoard({ leads, team, canDelete, onOpenDetail, onChangeStage, onDele
               <div style={{ fontSize: 12, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".03em" }}>
                 {stage.label}
               </div>
-              <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>{stageLeads.length}</span>
+              <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>{stageLeads.length}</span>
             </div>
             {stageLeads.length === 0 ? (
               <div style={{ fontSize: 12, color: "var(--muted)", padding: "16px 4px", textAlign: "center" }}>Nada aqui</div>
@@ -2453,12 +2707,13 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
       // Nessa etapa o follow-up é sempre a própria data da avaliação: nesse dia a equipe
       // tem que confirmar se o paciente veio e tentar reagendar caso tenha faltado.
       finish(buildPatch(dataAvaliacao || null));
-    } else if (lead) {
-      // Editando uma oportunidade existente: sempre confirma a data de follow-up antes de salvar.
-      setShowFollowUp(true);
     } else {
-      // Oportunidade nova: ainda não faz sentido ter follow-up, isso é definido na primeira edição.
-      finish(buildPatch(null));
+      // Qualquer outra etapa exige uma data de follow-up — tanto ao criar uma
+      // oportunidade nova quanto ao editar uma já existente (antes, só pedia
+      // na edição; oportunidade nova salvava sem follow-up nenhum). Planilha
+      // importada continua de fora disso: ela sempre entra em "Avaliação
+      // agendada" já com o follow-up preenchido automaticamente (ramo acima).
+      setShowFollowUp(true);
     }
   }
 
@@ -2515,7 +2770,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
             <div>
               <label className="gec-label">Etapa</label>
               <select className="gec-select" value={etapa} onChange={(e) => setEtapa(e.target.value)}>
-                {LEAD_STAGES.filter((s) => isGio || !INDICACAO_STAGE_IDS.includes(s.id)).map((s) => (
+                {stagesFor(isGio).map((s) => (
                   <option key={s.id} value={s.id}>{s.label}</option>
                 ))}
               </select>
@@ -2773,8 +3028,25 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
   const [showImport, setShowImport] = useState(false);
   const [showImportGio, setShowImportGio] = useState(false);
   const [filterClinica, setFilterClinica] = useState("todas");
+  const [busca, setBusca] = useState("");
+  const [filtroProcedimento, setFiltroProcedimento] = useState("");
+  const [filtroStatus, setFiltroStatus] = useState("todos");
 
-  const filtered = leads.filter((l) => (lockedClinicaId ? l.clinicaId === lockedClinicaId : filterClinica === "todas" || l.clinicaId === filterClinica));
+  const buscaNormalizada = normalizeSearch(busca);
+  const procedimentoNormalizado = normalizeSearch(filtroProcedimento);
+  const filtered = leads.filter((l) => {
+    if (lockedClinicaId ? l.clinicaId !== lockedClinicaId : !(filterClinica === "todas" || l.clinicaId === filterClinica)) return false;
+    if (buscaNormalizada && !normalizeSearch(l.nomePaciente).includes(buscaNormalizada)) return false;
+    if (procedimentoNormalizado && !normalizeSearch(l.procedimento).includes(procedimentoNormalizado)) return false;
+    if (filtroStatus !== "todos") {
+      const atrasado = isFollowUpAtrasado(l);
+      const vencendoHoje = !atrasado && isFollowUpHoje(l);
+      if (filtroStatus === "atrasado" && !atrasado) return false;
+      if (filtroStatus === "hoje" && !vencendoHoje) return false;
+      if (filtroStatus === "em_dia" && (atrasado || vencendoHoje)) return false;
+    }
+    return true;
+  });
   const modalClinica = lockedClinicaId || (filterClinica === "todas" ? CLINICAS[0].id : filterClinica);
   const isSorridentsView = lockedClinicaId ? lockedClinicaId === "sorridents" : filterClinica === "sorridents";
   const isGioView = lockedClinicaId ? lockedClinicaId === "gio" : filterClinica === "gio";
@@ -2783,16 +3055,54 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
     <>
       <div className="gec-fade-in">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 16 }}>
-          {!lockedClinicaId ? (
-            <select className="gec-select" style={{ width: "auto" }} value={filterClinica} onChange={(e) => setFilterClinica(e.target.value)}>
-              <option value="todas">Todas as clínicas</option>
-              {CLINICAS.map((c) => (
-                <option key={c.id} value={c.id}>{c.curto}</option>
-              ))}
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            {!lockedClinicaId ? (
+              <select className="gec-select" style={{ width: "auto" }} value={filterClinica} onChange={(e) => setFilterClinica(e.target.value)}>
+                <option value="todas">Todas as clínicas</option>
+                {CLINICAS.map((c) => (
+                  <option key={c.id} value={c.id}>{c.curto}</option>
+                ))}
+              </select>
+            ) : (
+              <div />
+            )}
+            <div style={{ position: "relative", width: 220 }}>
+              <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--muted)", pointerEvents: "none" }} />
+              <input
+                type="text"
+                className="gec-input"
+                style={{ width: "100%", paddingLeft: 30 }}
+                placeholder="Buscar por nome..."
+                value={busca}
+                onChange={(e) => setBusca(e.target.value)}
+                aria-label="Buscar oportunidade por nome"
+              />
+            </div>
+            <div style={{ position: "relative", width: 220 }}>
+              <Stethoscope size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--muted)", pointerEvents: "none" }} />
+              <input
+                type="text"
+                className="gec-input"
+                style={{ width: "100%", paddingLeft: 30 }}
+                placeholder="Filtrar por procedimento..."
+                value={filtroProcedimento}
+                onChange={(e) => setFiltroProcedimento(e.target.value)}
+                aria-label="Filtrar oportunidade por procedimento de interesse"
+              />
+            </div>
+            <select
+              className="gec-select"
+              style={{ width: "auto" }}
+              value={filtroStatus}
+              onChange={(e) => setFiltroStatus(e.target.value)}
+              aria-label="Filtrar oportunidade por status de atraso"
+            >
+              <option value="todos">Follow-up: todos</option>
+              <option value="atrasado">Atrasados</option>
+              <option value="hoje">Vence hoje</option>
+              <option value="em_dia">Em dia</option>
             </select>
-          ) : (
-            <div />
-          )}
+          </div>
           <div style={{ display: "flex", gap: 8 }}>
             {isSorridentsView && (
               <button className="gec-btn gec-btn-ghost" onClick={() => setShowImport(true)}>
@@ -2814,7 +3124,7 @@ function ComercialView({ leads, team, lockedClinicaId, currentUserId, canDelete,
             oportunidade ainda) — cada coluna já mostra "Nada aqui" quando
             vazia, mas a estrutura do funil fica visível pro time desde o
             início. */}
-        <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} hideIndicacaoStages={isSorridentsView} />
+        <LeadBoard leads={filtered} team={team} canDelete={canDelete} onOpenDetail={onOpenDetail} onChangeStage={onChangeStage} onDelete={onDelete} hideIndicacaoStages={isSorridentsView} hidePagamentoParcial={isGioView} />
       </div>
 
       {showModal && (
@@ -2969,30 +3279,38 @@ function COBRANCA_LABEL(formaPagamento) {
 // Cor/estilo do pill de "próximo vencimento", por status de proximoVencimentoInfo.
 const VENCIMENTO_PILL_STYLE = {
   atrasada: { background: "var(--danger-soft)", color: "var(--danger)" },
+  tolerancia: { background: "var(--warning-soft)", color: "var(--warning)" },
   hoje: { background: "var(--warning-soft)", color: "var(--warning)" },
   amanha: { background: "var(--warning-soft)", color: "var(--warning)" },
-  futura: { background: "#EAEDEA", color: "var(--muted)" },
+  futura: { background: "var(--surface-muted)", color: "var(--muted)" },
   paga: { background: "var(--success-soft)", color: "var(--success)" },
   quitada: { background: "var(--success-soft)", color: "var(--success)" },
-  inativa: { background: "#EAEDEA", color: "var(--muted)" },
+  inativa: { background: "var(--surface-muted)", color: "var(--muted)" },
 };
 
 // ---------- Cobranças da GIO: linha de um cliente ----------
-function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPaid }) {
-  // Mesma cor de fundo das tarefas/leads, olhando a tarefa de cobrança do
-  // ciclo atual: atrasada (venceu e ainda não foi gerada/concluída) fica
-  // vermelho leve, vencendo hoje fica amarelo leve, senão neutro — inclusive
-  // quando ainda não existe tarefa pra essa cobrança (nada vencendo agora).
-  const atrasada = !!tarefaAtual && isAtrasada(tarefaAtual);
-  const venceHoje = !atrasada && !!tarefaAtual && isVenceHoje(tarefaAtual);
-  const corStatus = atrasada
-    ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
-    : venceHoje
-    ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
-    : {};
+function CobrancaRow({ cobranca, onEdit, info, onMarkPaid, onUndoPaid }) {
+  // Mesma cor de fundo das tarefas/leads: só fica vermelho quando realmente
+  // "atrasada" (ciclo anterior não confirmado e já chegou o vencimento do mês
+  // seguinte — ver proximoVencimentoInfo). Vencida mas dentro da tolerância
+  // de 1 mês fica amarelo leve, igual "vence hoje", sem soar alarme à toa.
+  const corStatus =
+    info.status === "atrasada"
+      ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
+      : info.status === "hoje" || info.status === "tolerancia"
+      ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
+      : {};
+  const podeMarcarPaga = cobranca.ativo && !["paga", "quitada", "inativa"].includes(info.status);
+  // Só soa "aguardando confirmação" (pill laranja) quando já faz sentido
+  // esperar o pagamento (venceu, vence hoje/amanhã ou tá na tolerância) — pra
+  // um ciclo ainda longe (ex: vence em 18 dias) o botão de marcar como paga
+  // continua disponível (controle sempre na mesma aba), só sem soar alarme.
+  const aguardandoConfirmacao = podeMarcarPaga && info.status !== "futura";
+  const pagoEsteMes = cobranca.ativo && info.status === "paga";
+  const progressoParcelas = Math.min(100, Math.max(0, (cobranca.parcelasPagas / Math.max(1, cobranca.numeroParcelas)) * 100));
   return (
     <div
-      className="gec-card"
+      className="gec-card gec-clickable-card"
       style={{ padding: 14, display: "flex", flexDirection: "column", gap: 6, opacity: cobranca.ativo ? 1 : 0.6, cursor: "pointer", ...corStatus }}
       onClick={() => onEdit(cobranca)}
     >
@@ -3002,11 +3320,9 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPa
           <span className="gec-pill" style={{ background: "var(--primary-soft)", color: "var(--primary-dark)" }}>
             <CreditCard size={11} /> {COBRANCA_LABEL(cobranca.formaPagamento)} · dia {cobranca.diaVencimento}
           </span>
-          {info && (
-            <span className="gec-pill" style={VENCIMENTO_PILL_STYLE[info.status] || {}}>
-              <Clock size={11} /> {info.label}
-            </span>
-          )}
+          <span className="gec-pill" style={VENCIMENTO_PILL_STYLE[info.status] || {}}>
+            <Clock size={11} /> {info.label}
+          </span>
         </div>
       </div>
       <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", flexDirection: "column", gap: 3 }}>
@@ -3032,26 +3348,33 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPa
           {cobranca.valorParcela ? fmtMoney(cobranca.valorParcela) : "—"} · {cobranca.parcelasPagas} de {cobranca.numeroParcelas} parcelas pagas
           {cobranca.numeroParcelas - cobranca.parcelasPagas > 0 && ` (faltam ${cobranca.numeroParcelas - cobranca.parcelasPagas})`}
         </span>
+        <div className="gec-progress-track" aria-hidden="true">
+          <div className="gec-progress-fill" style={{ width: `${progressoParcelas}%` }} />
+        </div>
         {cobranca.observacoes && <span>{cobranca.observacoes}</span>}
       </div>
-      {tarefaAtual && tarefaAtual.status !== "concluida" && onMarkPaid && (
+      {podeMarcarPaga && onMarkPaid && (
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 4 }}>
-          <span className="gec-pill" style={{ background: "var(--warning-soft)", color: "var(--warning)" }}>
-            Aguardando confirmação de pagamento
-          </span>
+          {aguardandoConfirmacao ? (
+            <span className="gec-pill" style={{ background: "var(--warning-soft)", color: "var(--warning)" }}>
+              Aguardando confirmação de pagamento
+            </span>
+          ) : (
+            <span />
+          )}
           <button
-            className="gec-btn gec-btn-primary"
+            className={aguardandoConfirmacao ? "gec-btn gec-btn-primary" : "gec-btn gec-btn-ghost"}
             style={{ fontSize: 11.5, padding: "5px 9px" }}
             onClick={(e) => {
               e.stopPropagation();
-              onMarkPaid(tarefaAtual.id);
+              onMarkPaid(cobranca, info.cicloAberto);
             }}
           >
-            <CheckCircle2 size={12} /> Marcar como paga
+            <CheckCircle2 size={12} /> Marcar {fmtDate(info.cicloAberto)} como paga
           </button>
         </div>
       )}
-      {tarefaAtual && tarefaAtual.status === "concluida" && onUndoPaid && (
+      {pagoEsteMes && onUndoPaid && (
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 4 }}>
           <span className="gec-pill" style={{ background: "var(--success-soft)", color: "var(--success)" }}>
             <CheckCircle2 size={11} /> Paga
@@ -3061,7 +3384,7 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPa
             style={{ fontSize: 11.5, padding: "5px 9px" }}
             onClick={(e) => {
               e.stopPropagation();
-              onUndoPaid(tarefaAtual.id);
+              onUndoPaid(cobranca);
             }}
           >
             <Undo2 size={12} /> Desfazer
@@ -3073,16 +3396,13 @@ function CobrancaRow({ cobranca, onEdit, tarefaAtual, info, onMarkPaid, onUndoPa
 }
 
 // ---------- Cobranças da GIO: mini dashboard com visão geral ----------
-function CobrancasDashboard({ cobrancas, tasks }) {
+function CobrancasDashboard({ cobrancas }) {
   const hoje = todayISO();
   const ativas = cobrancas.filter((c) => c.ativo);
   const totalEsperadoMes = ativas.reduce((sum, c) => sum + (Number(c.valorParcela) || 0), 0);
   const boletos = ativas.filter((c) => c.formaPagamento === "boleto").length;
   const recorrentes = ativas.length - boletos;
-  // Usa o mesmo cálculo de "próximo vencimento" exibido em cada card, pra
-  // não contar como atrasada/vencendo uma cobrança cujo ciclo atual já foi
-  // marcado como paga (senão o número aqui bate menos que a lista abaixo).
-  const infos = ativas.map((c) => proximoVencimentoInfo(c, tarefaAtualDaCobranca(tasks, c.id), hoje));
+  const infos = ativas.map((c) => proximoVencimentoInfo(c, hoje));
   const vencendoEmBreve = infos.filter((i) => i.dias !== null && i.dias >= 0 && i.dias <= 7 && i.status !== "paga" && i.status !== "quitada").length;
   const vencendoHoje = infos.filter((i) => i.status === "hoje").length;
   const emAtraso = infos.filter((i) => i.status === "atrasada").length;
@@ -3119,10 +3439,10 @@ function CobrancasDashboard({ cobrancas, tasks }) {
 
 // Ordem de urgência pra lista de cobranças — atrasada primeiro, inativa por
 // último, independente do dia de vencimento cadastrado.
-const VENCIMENTO_STATUS_RANK = { atrasada: 0, hoje: 1, amanha: 2, futura: 3, paga: 4, quitada: 5, inativa: 6 };
+const VENCIMENTO_STATUS_RANK = { atrasada: 0, tolerancia: 1, hoje: 2, amanha: 3, futura: 4, paga: 5, quitada: 6, inativa: 7 };
 
 // ---------- Cobranças da GIO: lista ----------
-function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDelete, onMarkPaid, onUndoPaid }) {
+function CobrancasView({ cobrancas, canDelete, onCreate, onUpdate, onDelete, onMarkPaid, onUndoPaid }) {
   const [showModal, setShowModal] = useState(false);
   const [editTarget, setEditTarget] = useState(null);
   const [filtroForma, setFiltroForma] = useState("todas");
@@ -3130,13 +3450,9 @@ function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDele
 
   const hoje = todayISO();
 
-  // Cada cobrança já sai com a tarefa do ciclo atual e o resumo do próximo
-  // vencimento calculados uma vez só, reaproveitados pro filtro, pra
-  // ordenação e pro card.
-  const enriquecidas = cobrancas.map((c) => {
-    const tarefaAtual = tarefaAtualDaCobranca(tasks, c.id);
-    return { cobranca: c, tarefaAtual, info: proximoVencimentoInfo(c, tarefaAtual, hoje) };
-  });
+  // Cada cobrança já sai com o resumo do próximo vencimento calculado uma
+  // vez só, reaproveitado pro filtro, pra ordenação e pro card.
+  const enriquecidas = cobrancas.map((c) => ({ cobranca: c, info: proximoVencimentoInfo(c, hoje) }));
 
   const filtradas = enriquecidas.filter(({ cobranca }) => {
     if (filtroForma !== "todas" && cobranca.formaPagamento !== filtroForma) return false;
@@ -3158,14 +3474,14 @@ function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDele
     <div className="gec-fade-in">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 12.5, color: "var(--muted)", maxWidth: 480 }}>
-          Cadastro dos clientes em boleto ou cartão recorrente. O Pulso cria sozinho a tarefa de cobrança pra gerente da GIO perto de cada vencimento.
+          Cadastro dos clientes em boleto ou cartão recorrente. Marque aqui mesmo quando o pagamento do mês for confirmado — sem gerar tarefa em outra aba.
         </div>
         <button className="gec-btn gec-btn-primary" onClick={() => setShowModal(true)}>
           <Plus size={15} /> Nova cobrança
         </button>
       </div>
 
-      <CobrancasDashboard cobrancas={cobrancas} tasks={tasks} />
+      <CobrancasDashboard cobrancas={cobrancas} />
 
       {cobrancas.length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
@@ -3192,8 +3508,8 @@ function CobrancasView({ cobrancas, tasks, canDelete, onCreate, onUpdate, onDele
         <EmptyState icon={CreditCard} title="Nenhuma cobrança encontrada" subtitle="Ajuste os filtros acima pra ver outras cobranças." />
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {ordenadas.map(({ cobranca: c, tarefaAtual, info }) => (
-            <CobrancaRow key={c.id} cobranca={c} onEdit={setEditTarget} tarefaAtual={tarefaAtual} info={info} onMarkPaid={onMarkPaid} onUndoPaid={onUndoPaid} />
+          {ordenadas.map(({ cobranca: c, info }) => (
+            <CobrancaRow key={c.id} cobranca={c} onEdit={setEditTarget} info={info} onMarkPaid={onMarkPaid} onUndoPaid={onUndoPaid} />
           ))}
         </div>
       )}
@@ -3278,7 +3594,7 @@ function EstoqueCategoriaSection({ categoria, itens, canManage, expanded, onTogg
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <ChevronDown size={16} style={{ transform: expanded ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform .15s ease", color: "var(--muted)" }} />
           <span style={{ fontWeight: 600, fontSize: 14.5 }}>{categoria}</span>
-          <span className="gec-pill" style={{ background: "#EAEDEA", color: "var(--muted)" }}>{itens.length}</span>
+          <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>{itens.length}</span>
         </div>
         {faltandoCount > 0 && (
           <span className="gec-pill" style={{ background: "var(--danger-soft)", color: "var(--danger)" }}>
@@ -3628,6 +3944,7 @@ function EstoqueView({ itens, tipo, lockedClinicaId, canManage, onUpdateQty, onC
 // ---------- App shell ----------
 export default function PulsoApp() {
   useMidnightTick();
+  const [theme, setTheme] = useThemeMode();
   const [session, setSession] = useState(undefined);
   const [profile, setProfile] = useState(null);
   const [team, setTeam] = useState([]);
@@ -3637,6 +3954,7 @@ export default function PulsoApp() {
   const [checklist, setChecklist] = useState([]);
   const [activity, setActivity] = useState([]);
   const [leads, setLeads] = useState([]);
+  const [followupLog, setFollowupLog] = useState([]);
   const [estoque, setEstoque] = useState([]);
   const [cobrancas, setCobrancas] = useState([]);
   const [view, setView] = useState("painel");
@@ -3712,6 +4030,11 @@ export default function PulsoApp() {
     if (!error && data) setLeads(data.map(mapLead));
   }, []);
 
+  const fetchFollowupLog = useCallback(async () => {
+    const { data, error } = await supabase.from("lead_followup_log").select("*").order("resolvido_em", { ascending: false });
+    if (!error && data) setFollowupLog(data.map(mapFollowupLog));
+  }, []);
+
   const fetchEstoque = useCallback(async () => {
     const { data, error } = await supabase.from("estoque_itens").select("*").order("categoria").order("nome");
     if (!error && data) setEstoque(data.map(mapEstoqueItem));
@@ -3733,6 +4056,7 @@ export default function PulsoApp() {
       setChecklist([]);
       setActivity([]);
       setLeads([]);
+      setFollowupLog([]);
       setEstoque([]);
       setCobrancas([]);
       return;
@@ -3741,10 +4065,22 @@ export default function PulsoApp() {
       setProfileLoading(true);
       const p = await fetchProfile(session.user.id);
       setProfile(p);
-      if (p) await Promise.all([fetchTeam(), fetchTasks(), fetchAttachments(), fetchComments(), fetchChecklist(), fetchActivity(), fetchLeads(), fetchEstoque(), fetchCobrancas()]);
+      if (p)
+        await Promise.all([
+          fetchTeam(),
+          fetchTasks(),
+          fetchAttachments(),
+          fetchComments(),
+          fetchChecklist(),
+          fetchActivity(),
+          fetchLeads(),
+          fetchFollowupLog(),
+          fetchEstoque(),
+          fetchCobrancas(),
+        ]);
       setProfileLoading(false);
     })();
-  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchCobrancas]);
+  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas]);
 
   useEffect(() => {
     if (!profile) return;
@@ -3757,13 +4093,14 @@ export default function PulsoApp() {
       .on("postgres_changes", { event: "*", schema: "public", table: "task_checklist_items" }, () => fetchChecklist())
       .on("postgres_changes", { event: "*", schema: "public", table: "task_activity" }, () => fetchActivity())
       .on("postgres_changes", { event: "*", schema: "public", table: "leads" }, () => fetchLeads())
+      .on("postgres_changes", { event: "*", schema: "public", table: "lead_followup_log" }, () => fetchFollowupLog())
       .on("postgres_changes", { event: "*", schema: "public", table: "estoque_itens" }, () => fetchEstoque())
       .on("postgres_changes", { event: "*", schema: "public", table: "cobrancas" }, () => fetchCobrancas())
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchEstoque, fetchCobrancas]);
+  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas]);
 
   const uploadAttachment = useCallback(
     async (task, file) => {
@@ -4022,33 +4359,46 @@ export default function PulsoApp() {
     async (id, patch) => {
       const row = leadPatchToRow(patch);
       if (Object.keys(row).length === 0) return; // nada mudou, não precisa chamar o banco
+      const leadAntes = leads.find((l) => l.id === id);
       const { error } = await supabase.from("leads").update(row).eq("id", id);
       if (error) {
         const msg = friendlyLeadError(error, "Não foi possível salvar a oportunidade: ");
         setError(msg);
         throw new Error(msg);
       }
+      if (leadAntes) {
+        await registrarFollowUpResolvido(leadAntes, { ...leadAntes, ...patch }, profile?.id);
+        fetchFollowupLog();
+      }
       fetchLeads();
     },
-    [fetchLeads]
+    [leads, profile, fetchLeads, fetchFollowupLog]
   );
 
   const handleChangeLeadStage = useCallback(
     async (id, etapa) => {
+      const leadAntes = leads.find((l) => l.id === id);
       const patch = { etapa };
       // Fechado/perdido: não vamos mais entrar em contato, limpa o follow-up pendente.
       if (etapa === "fechado" || etapa === "perdido") patch.proximo_contato = null;
       // Avaliação agendada: o follow-up é sempre a data da avaliação (nesse dia a equipe
       // tem que confirmar se o paciente veio e tentar reagendar caso tenha faltado).
       if (etapa === "avaliacao_agendada") {
-        const lead = leads.find((l) => l.id === id);
-        patch.proximo_contato = lead?.dataAvaliacao || null;
+        patch.proximo_contato = leadAntes?.dataAvaliacao || null;
       }
       const { error } = await supabase.from("leads").update(patch).eq("id", id);
-      if (error) setError("Não foi possível mover a oportunidade: " + error.message);
-      else fetchLeads();
+      if (error) {
+        setError("Não foi possível mover a oportunidade: " + error.message);
+        return;
+      }
+      if (leadAntes) {
+        const depois = { ...leadAntes, etapa, proximoContato: "proximo_contato" in patch ? patch.proximo_contato : leadAntes.proximoContato };
+        await registrarFollowUpResolvido(leadAntes, depois, profile?.id);
+        fetchFollowupLog();
+      }
+      fetchLeads();
     },
-    [leads, fetchLeads]
+    [leads, profile, fetchLeads, fetchFollowupLog]
   );
 
   const handleDeleteLead = useCallback(
@@ -4156,6 +4506,7 @@ export default function PulsoApp() {
     if ("valorParcela" in patch) row.valor_parcela = patch.valorParcela;
     if ("numeroParcelas" in patch) row.numero_parcelas = patch.numeroParcelas;
     if ("parcelasPagas" in patch) row.parcelas_pagas = patch.parcelasPagas;
+    if ("ultimoCicloConfirmado" in patch) row.ultimo_ciclo_confirmado = patch.ultimoCicloConfirmado;
     if ("observacoes" in patch) row.observacoes = patch.observacoes || null;
     if ("ativo" in patch) row.ativo = patch.ativo;
     return row;
@@ -4192,97 +4543,53 @@ export default function PulsoApp() {
     [fetchCobrancas]
   );
 
-  // Cria a tarefa de cobrança (boleto/recorrente) do ciclo atual e avança o
+  // Confirma o pagamento do ciclo em aberto (mostrado no card) e avança o
   // contador de parcelas — desativa sozinha a cobrança quando a última
-  // parcela é alcançada, pra parar de gerar tarefa novas depois disso.
-  const handleGenerateCobrancaTask = useCallback(
-    async (cobranca, info, responsavelId) => {
-      const { error: insErr } = await supabase.from("tasks").insert({
-        titulo: info.titulo,
-        clinica_id: "gio",
-        responsavel_id: responsavelId,
-        prazo: info.prazo,
-        criado_por: profile?.id,
-        cobranca_id: cobranca.id,
-      });
-      // Se der erro (ex: outra sessão da equipe já criou essa mesma tarefa no
-      // mesmo instante — a trava do banco impede duplicar), não avança o
-      // contador de parcelas, pra não contar a mesma parcela duas vezes.
-      if (insErr) return;
+  // parcela é alcançada. Não mexe em tarefas: todo o controle fica só aqui,
+  // na aba Cobranças (ver proximoVencimentoInfo/cicloEmAbertoCobranca).
+  const handleMarkCobrancaPaid = useCallback(
+    async (cobranca, cicloAberto) => {
       const novasParcelasPagas = cobranca.parcelasPagas + 1;
-      await supabase
+      const { error } = await supabase
         .from("cobrancas")
-        .update({ parcelas_pagas: novasParcelasPagas, ativo: novasParcelasPagas < cobranca.numeroParcelas })
+        .update({
+          ultimo_ciclo_confirmado: cicloAberto,
+          parcelas_pagas: novasParcelasPagas,
+          ativo: novasParcelasPagas < cobranca.numeroParcelas,
+        })
         .eq("id", cobranca.id);
-      fetchTasks();
-      fetchCobrancas();
+      if (error) setError("Não foi possível confirmar o pagamento: " + error.message);
+      else fetchCobrancas();
     },
-    [profile, fetchTasks, fetchCobrancas]
+    [fetchCobrancas]
   );
 
-  // Toda vez que a lista de cobranças/tarefas muda (inclusive ao abrir o
-  // app), confere se alguma cobrança ativa da GIO precisa de uma tarefa hoje
-  // (boleto vencendo ou pagamento recorrente pra conferir) e cria — sempre
-  // pra gerente da GIO (ou pro dono, se não tiver gerente cadastrada lá).
-  useEffect(() => {
-    if (!profile || cobrancas.length === 0) return;
-    const hoje = todayISO();
-    const responsavelId =
-      team.find((m) => m.role === "gerente" && m.clinicaId === "gio")?.id ||
-      team.find((m) => m.role === "owner")?.id;
-    if (!responsavelId) return;
-    cobrancas
-      .filter((c) => c.ativo)
-      .forEach((c) => {
-        const info = computeCobrancaTask(c, hoje);
-        if (!info) return;
-        const jaExiste = tasks.some((t) => t.cobrancaId === c.id && t.prazo === info.prazo);
-        if (jaExiste) return;
-        handleGenerateCobrancaTask(c, info, responsavelId);
-      });
-  }, [cobrancas, tasks, team, profile, handleGenerateCobrancaTask]);
-
-  const handleGenerateFollowUpTask = useCallback(
-    async (lead, prazo, titulo, responsavelId) => {
-      const { error: insErr } = await supabase.from("tasks").insert({
-        titulo,
-        clinica_id: lead.clinicaId,
-        responsavel_id: responsavelId,
-        status: "pendente",
-        prazo,
-        criado_por: profile?.id,
-        categoria: "atendimento",
-        lead_id: lead.id,
-      });
-      // Se der erro (ex: outra sessão da equipe já criou essa mesma tarefa no
-      // mesmo instante — a trava do banco impede duplicar), não tem o que
-      // fazer além de deixar quieto; a próxima checagem não tenta de novo
-      // porque a tarefa já existe.
-      if (insErr) return;
-      fetchTasks();
+  // Desfaz a última confirmação de pagamento — sem limite de tempo. Volta o
+  // ciclo em aberto pro mês anterior (ou "nunca confirmado" se essa era a
+  // primeira) e recua a contagem de parcelas.
+  const handleUndoCobrancaPaid = useCallback(
+    async (cobranca) => {
+      const novasParcelasPagas = Math.max(0, cobranca.parcelasPagas - 1);
+      const novoUltimoCiclo =
+        novasParcelasPagas === 0 || !cobranca.ultimoCicloConfirmado
+          ? null
+          : dueDateMonthsAhead(cobranca.diaVencimento, cobranca.ultimoCicloConfirmado, -1);
+      const { error } = await supabase
+        .from("cobrancas")
+        .update({ ultimo_ciclo_confirmado: novoUltimoCiclo, parcelas_pagas: novasParcelasPagas, ativo: true })
+        .eq("id", cobranca.id);
+      if (error) setError("Não foi possível desfazer: " + error.message);
+      else fetchCobrancas();
     },
-    [profile, fetchTasks]
+    [fetchCobrancas]
   );
 
-  // Toda vez que a lista de leads/tarefas muda (inclusive ao abrir o app),
-  // confere se algum lead com responsável comercial definido está com
-  // follow-up (ou avaliação, na etapa "avaliação agendada" — ver
-  // leadContatoRelevante) vencendo hoje ou atrasado, e cria a tarefa
-  // correspondente pro responsável — mesmo mecanismo das Cobranças.
-  useEffect(() => {
-    if (!profile || leads.length === 0) return;
-    leads.forEach((l) => {
-      if (!l.responsavelComercial) return;
-      const atrasado = isFollowUpAtrasado(l);
-      const venceHoje = !atrasado && isFollowUpHoje(l);
-      if (!atrasado && !venceHoje) return;
-      const prazo = leadContatoRelevante(l);
-      const jaExiste = tasks.some((t) => t.leadId === l.id && t.prazo === prazo);
-      if (jaExiste) return;
-      const titulo = `${l.etapa === "avaliacao_agendada" ? "Confirmar avaliação" : "Follow-up"} — ${l.nomePaciente}`;
-      handleGenerateFollowUpTask(l, prazo, titulo, l.responsavelComercial);
-    });
-  }, [leads, tasks, profile, handleGenerateFollowUpTask]);
+  // Follow-up/avaliação atrasados ou vencendo hoje do Comercial NÃO geram
+  // mais tarefa de verdade na aba Tarefas — isso misturava os dois fluxos
+  // (a equipe passou a resolver o atraso ali, em vez de na própria aba
+  // Comercial). O aviso desses prazos agora vive só no Painel (Dashboard),
+  // que junta tarefas atrasadas + oportunidades atrasadas numa central só
+  // pra gestor/gerente — ver o `leadExtraItems` dentro do componente Dashboard.
   function estoquePatchToRow(patch) {
     const row = {};
     if ("clinicaId" in patch) row.clinica_id = patch.clinicaId;
@@ -4424,7 +4731,7 @@ export default function PulsoApp() {
 
   if (session === undefined || (session && profileLoading && !profile)) {
     return (
-      <div className="gec-root" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div className="gec-root" data-theme={theme} style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <GlobalStyle />
         <div style={{ color: "var(--muted)", fontSize: 13.5 }}>Carregando…</div>
       </div>
@@ -4469,6 +4776,21 @@ export default function PulsoApp() {
 
   const dashboardTasks = isOwner ? (effectiveClinica ? tasks.filter((t) => t.clinicaId === effectiveClinica) : tasks) : tasks.filter((t) => t.clinicaId === user.clinicaId);
 
+  const dashboardLeads = isOwner ? (effectiveClinica ? leads.filter((l) => l.clinicaId === effectiveClinica) : leads) : leads.filter((l) => l.clinicaId === user.clinicaId);
+
+  const dashboardFollowupLog = isOwner
+    ? effectiveClinica
+      ? followupLog.filter((f) => f.clinicaId === effectiveClinica)
+      : followupLog
+    : followupLog.filter((f) => f.clinicaId === user.clinicaId);
+
+  // Cobranças são só da GIO — mostra a central no Painel pra quem é da GIO,
+  // e pro dono também, menos quando ele filtrou o Painel só pra Sorridents
+  // (senão a seção aparece zerada à toa, parecendo que não tem cobrança
+  // nenhuma em vez de "não se aplica a essa clínica").
+  const dashboardCobrancas = isOwner ? (effectiveClinica ? cobrancas.filter((c) => c.clinicaId === effectiveClinica) : cobrancas) : cobrancas.filter((c) => c.clinicaId === user.clinicaId);
+  const showCobrancasNoPainel = isOwner ? effectiveClinica !== "sorridents" : user.clinicaId === "gio";
+
   const tasksViewTasks = isOwner ? (effectiveClinica ? tasks.filter((t) => t.clinicaId === effectiveClinica) : tasks) : tasks.filter((t) => t.clinicaId === user.clinicaId);
 
   const assignableOptions = getAssignableOptions(user, team).map((m) => ({ id: m.id, nome: m.nome }));
@@ -4505,6 +4827,7 @@ export default function PulsoApp() {
         ...(vePraGio ? [cobrancasTab] : []),
       ]
     : [
+        { id: "painel", label: "Painel", icon: LayoutDashboard },
         { id: "minhas", label: "Minhas tarefas", icon: ClipboardList },
         { id: "comercial", label: "Comercial", icon: Briefcase },
         { id: "estoque", label: "Estoque", icon: Package },
@@ -4517,7 +4840,7 @@ export default function PulsoApp() {
   const activeView = tabs.some((t) => t.id === view) ? view : tabs[0].id;
 
   return (
-    <div className="gec-root" style={{ minHeight: "100vh" }}>
+    <div className="gec-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <GlobalStyle />
       <div style={{ borderBottom: "1px solid var(--line)", background: "var(--surface)", position: "sticky", top: 0, zIndex: 10 }}>
         <div style={{ maxWidth: 960, margin: "0 auto", padding: "14px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
@@ -4544,6 +4867,7 @@ export default function PulsoApp() {
                 </div>
               )}
             </div>
+            <ThemeToggleButton theme={theme} setTheme={setTheme} />
             <button className="gec-btn gec-btn-ghost" style={{ padding: 8 }} onClick={handleLogout} aria-label="Sair">
               <LogOut size={14} />
             </button>
@@ -4571,8 +4895,15 @@ export default function PulsoApp() {
           </div>
         )}
 
-        {isOwner && activeView === "painel" && <Dashboard team={dashboardTeam} tasks={dashboardTasks} onOpenTask={setDetailTarget} />}
-        {isGerente && activeView === "painel" && <Dashboard team={dashboardTeam} tasks={dashboardTasks} onOpenTask={setDetailTarget} />}
+        {isOwner && activeView === "painel" && (
+          <Dashboard team={dashboardTeam} tasks={dashboardTasks} leads={dashboardLeads} followupLog={dashboardFollowupLog} cobrancas={dashboardCobrancas} showCobrancas={showCobrancasNoPainel} onOpenTask={setDetailTarget} onOpenLead={setDetailLead} onOpenCobrancas={() => setView("cobrancas")} />
+        )}
+        {isGerente && activeView === "painel" && (
+          <Dashboard team={dashboardTeam} tasks={dashboardTasks} leads={dashboardLeads} followupLog={dashboardFollowupLog} cobrancas={dashboardCobrancas} showCobrancas={showCobrancasNoPainel} onOpenTask={setDetailTarget} onOpenLead={setDetailLead} onOpenCobrancas={() => setView("cobrancas")} />
+        )}
+        {isBase && activeView === "painel" && (
+          <Dashboard team={dashboardTeam} tasks={dashboardTasks} leads={dashboardLeads} followupLog={dashboardFollowupLog} cobrancas={dashboardCobrancas} showCobrancas={showCobrancasNoPainel} onOpenTask={setDetailTarget} onOpenLead={setDetailLead} onOpenCobrancas={() => setView("cobrancas")} />
+        )}
 
         {isOwner && activeView === "tarefas" && (
           <TasksView
@@ -4611,7 +4942,6 @@ export default function PulsoApp() {
           <MyTasksView
             user={user}
             tasks={tasks}
-            leads={leads}
             assignableOptions={assignableOptions}
             lockedClinicaId={null}
             attachmentsByTask={attachmentsByTask}
@@ -4620,7 +4950,6 @@ export default function PulsoApp() {
             onUpdateStatus={handleUpdateStatus}
             onCreate={handleCreateTask}
             onOpenDetail={setDetailTarget}
-            onOpenLead={setDetailLead}
           />
         )}
 
@@ -4630,7 +4959,6 @@ export default function PulsoApp() {
           <MyTasksView
             user={user}
             tasks={tasks}
-            leads={leads}
             assignableOptions={assignableOptions}
             lockedClinicaId={user.clinicaId}
             attachmentsByTask={attachmentsByTask}
@@ -4639,7 +4967,6 @@ export default function PulsoApp() {
             onUpdateStatus={handleUpdateStatus}
             onCreate={handleCreateTask}
             onOpenDetail={setDetailTarget}
-            onOpenLead={setDetailLead}
           />
         )}
 
@@ -4647,7 +4974,6 @@ export default function PulsoApp() {
           <MyTasksView
             user={user}
             tasks={tasks}
-            leads={leads}
             assignableOptions={assignableOptions}
             lockedClinicaId={user.clinicaId}
             attachmentsByTask={attachmentsByTask}
@@ -4656,7 +4982,6 @@ export default function PulsoApp() {
             onUpdateStatus={handleUpdateStatus}
             onCreate={handleCreateTask}
             onOpenDetail={setDetailTarget}
-            onOpenLead={setDetailLead}
           />
         )}
 
@@ -4707,13 +5032,12 @@ export default function PulsoApp() {
         {activeView === "cobrancas" && (
           <CobrancasView
             cobrancas={cobrancas}
-            tasks={tasks}
             canDelete={canManage}
             onCreate={handleCreateCobranca}
             onUpdate={handleUpdateCobranca}
             onDelete={handleDeleteCobranca}
-            onMarkPaid={(taskId) => handleUpdateStatus(taskId, "concluida")}
-            onUndoPaid={(taskId) => handleUpdateStatus(taskId, "pendente")}
+            onMarkPaid={handleMarkCobrancaPaid}
+            onUndoPaid={handleUndoCobrancaPaid}
           />
         )}
       </div>
