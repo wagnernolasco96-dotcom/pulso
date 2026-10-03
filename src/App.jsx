@@ -40,6 +40,10 @@ import {
   Search,
   Sun,
   Moon,
+  Cake,
+  Copy,
+  Send,
+  ShoppingBag,
 } from "lucide-react";
 import {
   BarChart,
@@ -399,8 +403,20 @@ function roleLabel(role, clinicaId) {
   return clinicaInfo(clinicaId).baseRoleLabel;
 }
 
+// Data (AAAA-MM-DD) no fuso do navegador. Antes usava toISOString(), que é
+// UTC: no horário de Brasília o "hoje" virava amanhã a partir das 21h e
+// tarefas/follow-ups apareciam atrasados um dia antes da hora.
+function localDateISO(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return localDateISO(new Date());
+}
+// Converte um timestamp do banco (UTC) na data local em que ele aconteceu.
+function timestampToLocalISO(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  return isNaN(d) ? null : localDateISO(d);
 }
 
 // Força a tela inteira a re-renderizar assim que vira o dia, pra "atrasada"
@@ -447,7 +463,7 @@ function lastNDays(n) {
   for (let i = n - 1; i >= 0; i--) {
     const d = new Date(now);
     d.setDate(now.getDate() - i);
-    days.push(d.toISOString().slice(0, 10));
+    days.push(localDateISO(d));
   }
   return days;
 }
@@ -459,8 +475,8 @@ function lastNDays(n) {
 function countFollowUpsWindow(log, memberId, days) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - (days - 1));
-  const cutoffISO = cutoff.toISOString().slice(0, 10);
-  return log.filter((f) => f.resolvidoPor === memberId && f.resolvidoEm && f.resolvidoEm.slice(0, 10) >= cutoffISO).length;
+  const cutoffISO = localDateISO(cutoff);
+  return log.filter((f) => f.resolvidoPor === memberId && f.resolvidoEm && timestampToLocalISO(f.resolvidoEm) >= cutoffISO).length;
 }
 
 function memberName(id, team) {
@@ -2835,7 +2851,7 @@ function LeadModal({ lead, clinicaId, team, currentUserId, canDelete, onClose, o
                 <textarea className="gec-textarea" rows={3} value={observacoes} onChange={(e) => setObservacoes(e.target.value)} />
               </div>
               {lead && (
-                <div style={{ fontSize: 11.5, color: "var(--muted)" }}>Oportunidade criada em {fmtDate(lead.criadoEm?.slice(0, 10))}</div>
+                <div style={{ fontSize: 11.5, color: "var(--muted)" }}>Oportunidade criada em {fmtDate(timestampToLocalISO(lead.criadoEm))}</div>
               )}
             </>
           )}
@@ -3942,6 +3958,443 @@ function EstoqueView({ itens, tipo, lockedClinicaId, canManage, onUpdateQty, onC
 }
 
 // ---------- App shell ----------
+// ---------- Aniversariantes do mês (só GIO) ----------
+// Kanban da campanha de aniversário: cada paciente passa por
+// "Enviar mensagem" -> "Mensagem enviada" -> "Agendou cortesia" -> "Comprou". A mensagem já vem
+// pronta do banco (com o primeiro nome) e o botão do WhatsApp abre a
+// conversa com o texto preenchido.
+const ANIV_STAGES = [
+  { id: "enviar", label: "Enviar mensagem" },
+  { id: "enviado", label: "Mensagem enviada" },
+  { id: "agendou", label: "Agendou cortesia" },
+  { id: "comprou", label: "Comprou" },
+];
+const MESES_PT = ["Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho", "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"];
+
+function mapAniversariante(row) {
+  return {
+    id: row.id,
+    clinicaId: row.clinica_id,
+    mesRef: row.mes_ref,
+    codigoPaciente: row.codigo_paciente,
+    nomePaciente: row.nome_paciente,
+    primeiroNome: row.primeiro_nome,
+    whatsapp: row.whatsapp,
+    dataAniversario: row.data_aniversario,
+    prioridade: row.prioridade,
+    ultimoAtendimento: row.ultimo_atendimento,
+    proximoAgendamento: row.proximo_agendamento,
+    dataEnvio: row.data_envio,
+    mensagem: row.mensagem,
+    status: row.status,
+    enviadoEm: row.enviado_em,
+    enviadoPor: row.enviado_por,
+    agendouEm: row.agendou_em,
+    dataCortesia: row.data_cortesia,
+    comprouEm: row.comprou_em,
+    procedimento: row.procedimento,
+    valorPago: row.valor_pago,
+    observacoes: row.observacoes,
+  };
+}
+
+function anivToRow(a) {
+  return {
+    id: a.id, clinica_id: a.clinicaId, mes_ref: a.mesRef, codigo_paciente: a.codigoPaciente, nome_paciente: a.nomePaciente,
+    primeiro_nome: a.primeiroNome, whatsapp: a.whatsapp, data_aniversario: a.dataAniversario, prioridade: a.prioridade,
+    ultimo_atendimento: a.ultimoAtendimento, proximo_agendamento: a.proximoAgendamento, data_envio: a.dataEnvio,
+    mensagem: a.mensagem, status: a.status, enviado_em: a.enviadoEm, enviado_por: a.enviadoPor, agendou_em: a.agendouEm, data_cortesia: a.dataCortesia, comprou_em: a.comprouEm,
+    procedimento: a.procedimento, valor_pago: a.valorPago, observacoes: a.observacoes,
+  };
+}
+
+function mesRefLabel(iso) {
+  if (!iso) return "";
+  const [y, m] = iso.split("-");
+  return `${MESES_PT[Number(m) - 1]} ${y}`;
+}
+
+function waLinkComTexto(whatsapp, texto) {
+  const base = waLink(whatsapp);
+  if (!base) return null;
+  return texto ? `${base}?text=${encodeURIComponent(texto)}` : base;
+}
+
+// Dias de calendário entre a data/hora informada e hoje (no fuso local).
+function diasDesdeISO(isoDateTime) {
+  if (!isoDateTime) return null;
+  const d = new Date(isoDateTime);
+  const inicio = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const agora = new Date();
+  const hoje = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
+  return Math.max(0, Math.round((hoje - inicio) / 86400000));
+}
+
+// Aceita "809", "809,50", "1.200,50" e "809.50".
+function parseValorBR(texto) {
+  const t = String(texto || "").trim().replace(/[R$\s]/g, "");
+  if (!t) return null;
+  const normalizado = t.includes(",") ? t.replace(/\./g, "").replace(",", ".") : t;
+  const v = Number(normalizado);
+  return Number.isFinite(v) && v >= 0 ? v : NaN;
+}
+
+function AnivPrioridadePill({ prioridade }) {
+  if (!prioridade) return null;
+  const n = prioridade.charAt(0);
+  const label = n === "1" ? "Já agendada" : n === "2" ? "Atendida em 12 meses" : n === "3" ? "Agenda em 18 meses" : prioridade;
+  const style =
+    n === "1"
+      ? { background: "var(--accent-soft)", color: "var(--accent)" }
+      : n === "2"
+      ? { background: "var(--warning-soft)", color: "var(--warning)" }
+      : { background: "var(--surface-muted)", color: "var(--muted)" };
+  return <span className="gec-pill" style={style}>{label}</span>;
+}
+
+function AniversarianteCard({ item, team, onMarcarEnviado, onAgendou, onComprou, onVoltar }) {
+  const [copiado, setCopiado] = useState(false);
+  const hoje = todayISO();
+  const pendente = item.status === "enviar";
+  const atrasado = pendente && item.dataEnvio && item.dataEnvio < hoje;
+  const deHoje = pendente && item.dataEnvio === hoje;
+  const cardStyle = atrasado
+    ? { borderColor: "var(--danger)", background: "var(--danger-soft)" }
+    : deHoje
+    ? { borderColor: "var(--warning)", background: "var(--warning-soft)" }
+    : undefined;
+  const link = waLinkComTexto(item.whatsapp, item.mensagem);
+  const quemEnviou = team.find((m) => m.id === item.enviadoPor);
+  const dias = diasDesdeISO(item.enviadoEm);
+
+  async function copiar() {
+    try {
+      await navigator.clipboard.writeText(item.mensagem || "");
+      setCopiado(true);
+      setTimeout(() => setCopiado(false), 1800);
+    } catch {
+      // Navegador sem permissão de área de transferência: a pessoa usa o botão do WhatsApp.
+    }
+  }
+
+  return (
+    <div className="gec-task-card" style={cardStyle}>
+      <div style={{ fontWeight: 600, fontSize: 13.5 }}>{item.nomePaciente}</div>
+      <div style={{ fontSize: 11.5, color: "var(--muted)", display: "flex", flexDirection: "column", gap: 3 }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 5, fontWeight: 600, color: "var(--primary-dark)" }}>
+          <Cake size={11} /> Aniversário: {fmtDate(item.dataAniversario)}
+        </span>
+        {item.whatsapp && (
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <Phone size={11} /> {item.whatsapp}
+          </span>
+        )}
+        {item.ultimoAtendimento && <span>Último atendimento: {fmtDate(item.ultimoAtendimento)}</span>}
+        {item.proximoAgendamento && (
+          <span style={{ color: "var(--accent)", fontWeight: 600 }}>Agendada para {fmtDate(item.proximoAgendamento)}</span>
+        )}
+        {pendente && item.dataEnvio && (
+          <span style={{ fontWeight: 600, color: atrasado ? "var(--danger)" : deHoje ? "var(--warning)" : "var(--muted)" }}>
+            Enviar em {fmtDate(item.dataEnvio)}
+            {atrasado && " (atrasado)"}
+            {deHoje && " (hoje)"}
+          </span>
+        )}
+        {item.status === "enviado" && (
+          <span>
+            Enviada {dias === 0 ? "hoje" : dias === 1 ? "ontem" : `há ${dias} dias`}
+            {quemEnviou ? ` por ${quemEnviou.nome}` : ""}
+          </span>
+        )}
+        {item.status === "agendou" && (
+          <span style={{ color: "var(--accent)", fontWeight: 600 }}>
+            Peeling cortesia{item.dataCortesia ? ` em ${fmtDate(item.dataCortesia)}` : " agendado"}
+          </span>
+        )}
+        {item.status === "comprou" && (
+          <span style={{ color: "var(--primary-dark)", fontWeight: 600 }}>
+            {item.procedimento || "Procedimento"}
+            {item.valorPago ? ` · ${fmtMoney(item.valorPago)}` : ""}
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <AnivPrioridadePill prioridade={item.prioridade} />
+      </div>
+
+      {item.status !== "comprou" && (
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+          {link && (
+            <a
+              href={link}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="gec-btn gec-btn-ghost"
+              style={{ fontSize: 11, padding: "4px 7px", color: "#128C7E", textDecoration: "none" }}
+              title="Abrir a conversa no WhatsApp com a mensagem pronta"
+            >
+              <MessageCircle size={12} /> WhatsApp
+            </a>
+          )}
+          <button className="gec-btn gec-btn-ghost" style={{ fontSize: 11, padding: "4px 7px" }} onClick={copiar}>
+            <Copy size={12} /> {copiado ? "Copiada!" : "Copiar"}
+          </button>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {item.status === "enviar" && (
+          <button className="gec-btn gec-btn-primary" style={{ fontSize: 11.5, padding: "6px 10px" }} onClick={() => onMarcarEnviado(item)}>
+            <Send size={12} /> Marcar como enviada
+          </button>
+        )}
+        {item.status === "enviado" && (
+          <>
+            <button className="gec-btn gec-btn-primary" style={{ fontSize: 11.5, padding: "6px 10px" }} onClick={() => onAgendou(item)}>
+              <Calendar size={12} /> Agendou cortesia
+            </button>
+            <button className="gec-btn gec-btn-ghost" style={{ fontSize: 11.5, padding: "5px 9px" }} onClick={() => onComprou(item)}>
+              <ShoppingBag size={12} /> Comprou
+            </button>
+            <button className="gec-btn gec-btn-ghost" style={{ fontSize: 11.5, padding: "5px 9px" }} onClick={() => onVoltar(item)}>
+              <Undo2 size={12} /> Voltar
+            </button>
+          </>
+        )}
+        {item.status === "agendou" && (
+          <>
+            <button className="gec-btn gec-btn-ghost" style={{ fontSize: 11.5, padding: "5px 9px" }} onClick={() => onVoltar(item)}>
+              <Undo2 size={12} /> Voltar
+            </button>
+            <button className="gec-btn gec-btn-primary" style={{ fontSize: 11.5, padding: "6px 10px" }} onClick={() => onComprou(item)}>
+              <ShoppingBag size={12} /> Comprou
+            </button>
+          </>
+        )}
+        {item.status === "comprou" && (
+          <button className="gec-btn gec-btn-ghost" style={{ fontSize: 11.5, padding: "5px 9px" }} onClick={() => onVoltar(item)}>
+            <Undo2 size={12} /> Desfazer
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AnivAgendouModal({ item, onClose, onConfirm }) {
+  const [data, setData] = useState(item.dataCortesia || "");
+  return (
+    <div className="gec-modal-overlay" onClick={onClose}>
+      <div className="gec-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 360 }}>
+        <div className="gec-display" style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>{item.nomePaciente} agendou a cortesia</div>
+        <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 16 }}>Informe a data do peeling de diamante, se já tiver.</p>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            onConfirm({ dataCortesia: data || null });
+          }}
+          style={{ display: "flex", flexDirection: "column", gap: 14 }}
+        >
+          <div>
+            <label className="gec-label">Data do peeling</label>
+            <input type="date" className="gec-input" value={data} onChange={(e) => setData(e.target.value)} autoFocus />
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <button type="button" className="gec-btn gec-btn-ghost" onClick={onClose}>Voltar</button>
+            <button type="submit" className="gec-btn gec-btn-primary">Salvar</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function AnivCompraModal({ item, onClose, onConfirm }) {
+  const [procedimento, setProcedimento] = useState(item.procedimento || "");
+  const [valor, setValor] = useState(item.valorPago != null ? String(item.valorPago) : "");
+  const [erroValor, setErroValor] = useState("");
+  function submit(e) {
+    e.preventDefault();
+    const v = parseValorBR(valor);
+    if (Number.isNaN(v)) {
+      setErroValor("Valor inválido. Use, por exemplo, 809,00");
+      return;
+    }
+    onConfirm({ procedimento: procedimento.trim() || null, valorPago: v });
+  }
+  return (
+    <div className="gec-modal-overlay" onClick={onClose}>
+      <div className="gec-modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 380 }}>
+        <div className="gec-display" style={{ fontSize: 16, fontWeight: 600, marginBottom: 6 }}>{item.nomePaciente} comprou</div>
+        <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 16 }}>Registre o que ela fechou para medir o resultado da campanha.</p>
+        <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div>
+            <label className="gec-label">Procedimento</label>
+            <input className="gec-input" value={procedimento} onChange={(e) => setProcedimento(e.target.value)} placeholder="Ex.: Toxina botulínica" autoFocus />
+          </div>
+          <div>
+            <label className="gec-label">Valor pago (R$)</label>
+            <input
+              className="gec-input"
+              inputMode="decimal"
+              value={valor}
+              onChange={(e) => {
+                setValor(e.target.value);
+                setErroValor("");
+              }}
+              placeholder="Ex.: 809,00"
+            />
+            {erroValor && <div style={{ fontSize: 12, color: "var(--danger)", marginTop: 4 }}>{erroValor}</div>}
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <button type="button" className="gec-btn gec-btn-ghost" onClick={onClose}>Voltar</button>
+            <button type="submit" className="gec-btn gec-btn-primary">Salvar</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function AniversariantesView({ itens, team, onMarcarEnviado, onRegistrarAgendamento, onRegistrarCompra, onVoltar }) {
+  const meses = useMemo(() => Array.from(new Set(itens.map((i) => i.mesRef))).sort().reverse(), [itens]);
+  const mesAtualISO = todayISO().slice(0, 7) + "-01";
+  const [mes, setMes] = useState(null);
+  const mesSelecionado = mes || (meses.includes(mesAtualISO) ? mesAtualISO : meses[0]);
+  const [busca, setBusca] = useState("");
+  const [filtroPrioridade, setFiltroPrioridade] = useState("todas");
+  const [filtroEnvio, setFiltroEnvio] = useState("todos");
+  const [compraItem, setCompraItem] = useState(null);
+  const [agendouItem, setAgendouItem] = useState(null);
+
+  const hoje = todayISO();
+  const doMes = itens.filter((i) => i.mesRef === mesSelecionado);
+  const buscaN = normalizeSearch(busca);
+  const filtrados = doMes.filter((i) => {
+    if (buscaN && !normalizeSearch(i.nomePaciente).includes(buscaN)) return false;
+    if (filtroPrioridade !== "todas" && !(i.prioridade || "").startsWith(filtroPrioridade)) return false;
+    if (filtroEnvio === "hoje" && !(i.status === "enviar" && i.dataEnvio && i.dataEnvio <= hoje)) return false;
+    return true;
+  });
+
+  const total = doMes.length;
+  const enviados = doMes.filter((i) => i.status !== "enviar").length;
+  const compraram = doMes.filter((i) => i.status === "comprou");
+  const agendaram = doMes.filter((i) => i.status === "agendou" || (i.status === "comprou" && i.agendouEm)).length;
+  const faturado = compraram.reduce((s, i) => s + (Number(i.valorPago) || 0), 0);
+  const paraHoje = doMes.filter((i) => i.status === "enviar" && i.dataEnvio && i.dataEnvio <= hoje).length;
+
+  const ordenar = (stageId) => (a, b) => {
+    const chave = (x) =>
+      stageId === "enviar" ? x.dataEnvio || "" : stageId === "enviado" ? x.enviadoEm || "" : stageId === "agendou" ? x.dataCortesia || "9999" : x.comprouEm || "";
+    const ka = chave(a);
+    const kb = chave(b);
+    const crescente = stageId === "enviar" || stageId === "agendou";
+    if (ka !== kb) return crescente ? (ka < kb ? -1 : 1) : ka > kb ? -1 : 1;
+    return (a.prioridade || "").localeCompare(b.prioridade || "");
+  };
+
+  if (meses.length === 0) {
+    return <EmptyState icon={Cake} title="Nenhuma aniversariante carregada" subtitle="A lista do mês ainda não foi importada." />;
+  }
+
+  return (
+    <div className="gec-fade-in">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <div className="gec-display" style={{ fontSize: 18, fontWeight: 600, display: "flex", alignItems: "center", gap: 8 }}>
+          <Cake size={18} /> Aniversariantes
+        </div>
+        {meses.length > 1 ? (
+          <select className="gec-select" style={{ width: "auto" }} value={mesSelecionado} onChange={(e) => setMes(e.target.value)}>
+            {meses.map((m) => (
+              <option key={m} value={m}>{mesRefLabel(m)}</option>
+            ))}
+          </select>
+        ) : (
+          <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>{mesRefLabel(mesSelecionado)}</span>
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 16 }}>
+        {[
+          { label: "Para enviar hoje", value: paraHoje, color: paraHoje > 0 ? "var(--warning)" : undefined },
+          { label: "Mensagens enviadas", value: `${enviados} de ${total}` },
+          { label: "Agendaram cortesia", value: agendaram },
+          { label: "Compraram", value: compraram.length },
+          { label: "Vendido na campanha", value: fmtMoney(faturado) },
+        ].map((k) => (
+          <div key={k.label} className="gec-card" style={{ padding: "12px 14px" }}>
+            <div style={{ fontSize: 11.5, color: "var(--muted)" }}>{k.label}</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: k.color || "var(--text)" }}>{k.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+        <div style={{ position: "relative", flex: "1 1 200px" }}>
+          <Search size={14} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--muted)" }} />
+          <input className="gec-input" style={{ paddingLeft: 30 }} placeholder="Buscar paciente" value={busca} onChange={(e) => setBusca(e.target.value)} />
+        </div>
+        <select className="gec-select" style={{ width: "auto" }} value={filtroPrioridade} onChange={(e) => setFiltroPrioridade(e.target.value)}>
+          <option value="todas">Todas as prioridades</option>
+          <option value="1">Já agendadas</option>
+          <option value="2">Atendidas em 12 meses</option>
+          <option value="3">Agenda em 18 meses</option>
+        </select>
+        <select className="gec-select" style={{ width: "auto" }} value={filtroEnvio} onChange={(e) => setFiltroEnvio(e.target.value)}>
+          <option value="todos">Todas as datas</option>
+          <option value="hoje">Só para enviar hoje</option>
+        </select>
+      </div>
+
+      <div className="gec-scrollbar" style={{ display: "flex", gap: 14, overflowX: "auto", paddingBottom: 8, alignItems: "flex-start" }}>
+        {ANIV_STAGES.map((stage) => {
+          const lista = filtrados.filter((i) => i.status === stage.id).slice().sort(ordenar(stage.id));
+          return (
+            <div key={stage.id} className="gec-column" style={{ flex: "1 1 0", minWidth: 215 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, padding: "0 2px" }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".03em" }}>{stage.label}</div>
+                <span className="gec-pill" style={{ background: "var(--surface-muted)", color: "var(--muted)" }}>{lista.length}</span>
+              </div>
+              {lista.length === 0 ? (
+                <div style={{ fontSize: 12, color: "var(--muted)", padding: "16px 4px", textAlign: "center" }}>Nada aqui</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {lista.map((i) => (
+                    <AniversarianteCard key={i.id} item={i} team={team} onMarcarEnviado={onMarcarEnviado} onAgendou={setAgendouItem} onComprou={setCompraItem} onVoltar={onVoltar} />
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {agendouItem && (
+        <AnivAgendouModal
+          item={agendouItem}
+          onClose={() => setAgendouItem(null)}
+          onConfirm={async (patch) => {
+            await onRegistrarAgendamento(agendouItem, patch);
+            setAgendouItem(null);
+          }}
+        />
+      )}
+
+      {compraItem && (
+        <AnivCompraModal
+          item={compraItem}
+          onClose={() => setCompraItem(null)}
+          onConfirm={async (patch) => {
+            await onRegistrarCompra(compraItem, patch);
+            setCompraItem(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 export default function PulsoApp() {
   useMidnightTick();
   const [theme, setTheme] = useThemeMode();
@@ -3957,6 +4410,7 @@ export default function PulsoApp() {
   const [followupLog, setFollowupLog] = useState([]);
   const [estoque, setEstoque] = useState([]);
   const [cobrancas, setCobrancas] = useState([]);
+  const [aniversariantes, setAniversariantes] = useState([]);
   const [view, setView] = useState("painel");
   const [ownerClinicView, setOwnerClinicView] = useState("todas");
   const [detailTarget, setDetailTarget] = useState(null);
@@ -4045,6 +4499,11 @@ export default function PulsoApp() {
     if (!error && data) setCobrancas(data.map(mapCobranca));
   }, []);
 
+  const fetchAniversariantes = useCallback(async () => {
+    const { data, error } = await supabase.from("aniversariantes").select("*").order("data_envio");
+    if (!error && data) setAniversariantes(data.map(mapAniversariante));
+  }, []);
+
   useEffect(() => {
     if (session === undefined) return;
     if (!session) {
@@ -4059,6 +4518,7 @@ export default function PulsoApp() {
       setFollowupLog([]);
       setEstoque([]);
       setCobrancas([]);
+      setAniversariantes([]);
       return;
     }
     (async () => {
@@ -4077,10 +4537,11 @@ export default function PulsoApp() {
           fetchFollowupLog(),
           fetchEstoque(),
           fetchCobrancas(),
+          fetchAniversariantes(),
         ]);
       setProfileLoading(false);
     })();
-  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas]);
+  }, [session, fetchProfile, fetchTeam, fetchTasks, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas, fetchAniversariantes]);
 
   useEffect(() => {
     if (!profile) return;
@@ -4096,11 +4557,12 @@ export default function PulsoApp() {
       .on("postgres_changes", { event: "*", schema: "public", table: "lead_followup_log" }, () => fetchFollowupLog())
       .on("postgres_changes", { event: "*", schema: "public", table: "estoque_itens" }, () => fetchEstoque())
       .on("postgres_changes", { event: "*", schema: "public", table: "cobrancas" }, () => fetchCobrancas())
+      .on("postgres_changes", { event: "*", schema: "public", table: "aniversariantes" }, () => fetchAniversariantes())
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas]);
+  }, [profile, fetchTasks, fetchTeam, fetchAttachments, fetchComments, fetchChecklist, fetchActivity, fetchLeads, fetchFollowupLog, fetchEstoque, fetchCobrancas, fetchAniversariantes]);
 
   const uploadAttachment = useCallback(
     async (task, file) => {
@@ -4584,6 +5046,46 @@ export default function PulsoApp() {
     [fetchCobrancas]
   );
 
+  // ---------- Aniversariantes: mudar de coluna ----------
+  const updateAniversariante = useCallback(
+    async (id, row) => {
+      // Atualiza a tela na hora e confirma no banco em seguida.
+      setAniversariantes((prev) => prev.map((a) => (a.id === id ? mapAniversariante({ ...anivToRow(a), ...row }) : a)));
+      const { error } = await supabase.from("aniversariantes").update(row).eq("id", id);
+      if (error) setError("Não foi possível atualizar a aniversariante: " + error.message);
+      fetchAniversariantes();
+    },
+    [fetchAniversariantes]
+  );
+  const handleAnivEnviado = useCallback(
+    (item) => updateAniversariante(item.id, { status: "enviado", enviado_em: new Date().toISOString(), enviado_por: profile?.id || null }),
+    [updateAniversariante, profile]
+  );
+  const handleAnivAgendou = useCallback(
+    (item, patch) =>
+      updateAniversariante(item.id, { status: "agendou", agendou_em: new Date().toISOString(), data_cortesia: patch.dataCortesia }),
+    [updateAniversariante]
+  );
+  const handleAnivCompra = useCallback(
+    (item, patch) =>
+      updateAniversariante(item.id, {
+        status: "comprou",
+        comprou_em: new Date().toISOString(),
+        procedimento: patch.procedimento,
+        valor_pago: patch.valorPago,
+      }),
+    [updateAniversariante]
+  );
+  const handleAnivVoltar = useCallback(
+    (item) =>
+      item.status === "comprou"
+        ? updateAniversariante(item.id, { status: item.agendouEm ? "agendou" : "enviado", comprou_em: null, procedimento: null, valor_pago: null })
+        : item.status === "agendou"
+        ? updateAniversariante(item.id, { status: "enviado", agendou_em: null, data_cortesia: null })
+        : updateAniversariante(item.id, { status: "enviar", enviado_em: null, enviado_por: null }),
+    [updateAniversariante]
+  );
+
   // Follow-up/avaliação atrasados ou vencendo hoje do Comercial NÃO geram
   // mais tarefa de verdade na aba Tarefas — isso misturava os dois fluxos
   // (a equipe passou a resolver o atraso ali, em vez de na própria aba
@@ -4805,6 +5307,10 @@ export default function PulsoApp() {
   const cobrancasTab = { id: "cobrancas", label: "Cobranças", icon: CreditCard };
   const vePraGio = user.clinicaId === "gio";
 
+  // Aba de Aniversariantes: campanha só da GIO — gestor sempre vê,
+  // gerente/base só se forem da GIO.
+  const aniversariantesTab = { id: "aniversariantes", label: "Aniversariantes", icon: Cake };
+
   const tabs = isOwner
     ? [
         { id: "painel", label: "Painel", icon: LayoutDashboard },
@@ -4814,6 +5320,7 @@ export default function PulsoApp() {
         { id: "estoque", label: "Estoque", icon: Package },
         limpezaTab,
         cobrancasTab,
+        aniversariantesTab,
         { id: "equipe", label: "Equipe", icon: Users },
       ]
     : isGerente
@@ -4824,7 +5331,7 @@ export default function PulsoApp() {
         { id: "comercial", label: "Comercial", icon: Briefcase },
         { id: "estoque", label: "Estoque", icon: Package },
         ...(vePraSorridents ? [limpezaTab] : []),
-        ...(vePraGio ? [cobrancasTab] : []),
+        ...(vePraGio ? [cobrancasTab, aniversariantesTab] : []),
       ]
     : [
         { id: "painel", label: "Painel", icon: LayoutDashboard },
@@ -4832,7 +5339,7 @@ export default function PulsoApp() {
         { id: "comercial", label: "Comercial", icon: Briefcase },
         { id: "estoque", label: "Estoque", icon: Package },
         ...(vePraSorridents ? [limpezaTab] : []),
-        ...(vePraGio ? [cobrancasTab] : []),
+        ...(vePraGio ? [cobrancasTab, aniversariantesTab] : []),
       ];
 
   // Se a aba guardada em `view` não existe mais pro papel atual (ex: base
@@ -5026,6 +5533,17 @@ export default function PulsoApp() {
             onUpdateItem={handleUpdateEstoqueItem}
             onDeleteItem={handleDeleteEstoqueItem}
             onSolicitarPedido={handleSolicitarPedido}
+          />
+        )}
+
+        {activeView === "aniversariantes" && (
+          <AniversariantesView
+            itens={aniversariantes.filter((a) => a.clinicaId === "gio")}
+            team={ownerAndStaff}
+            onMarcarEnviado={handleAnivEnviado}
+            onRegistrarAgendamento={handleAnivAgendou}
+            onRegistrarCompra={handleAnivCompra}
+            onVoltar={handleAnivVoltar}
           />
         )}
 
